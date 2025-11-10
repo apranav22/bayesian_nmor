@@ -1,5 +1,5 @@
 .ruff_cache/
-
+Tests/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

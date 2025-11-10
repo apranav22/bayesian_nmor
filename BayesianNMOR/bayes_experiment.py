@@ -34,7 +34,7 @@ def alpha_theory(B_total: np.ndarray | float, Gamma: float = 1.0) -> np.ndarray 
 
     alpha(B) = B / (B^2 + Gamma^2)
     """
-    return B_total / (B_total ** 2 + Gamma ** 2)
+    return B_total / (B_total**2 + Gamma**2)
 
 
 # --- Likelihood for a measurement ---
@@ -115,19 +115,23 @@ def expected_KL(
 
     for alpha in alphas:
         # Marginal likelihood P(alpha | B_bias)
-        integrand = np.array([
-            likelihood(alpha, b, B_bias, sigma, Gamma) * prior[k]
-            for k, b in enumerate(B_grid)
-        ])
+        integrand = np.array(
+            [
+                likelihood(alpha, b, B_bias, sigma, Gamma) * prior[k]
+                for k, b in enumerate(B_grid)
+            ]
+        )
         P_alpha_val = simpson(integrand, B_grid)
         if P_alpha_val < 1e-18:
             continue
 
         # Posterior given alpha
-        post = np.array([
-            likelihood(alpha, b, B_bias, sigma, Gamma) * prior[k]
-            for k, b in enumerate(B_grid)
-        ])
+        post = np.array(
+            [
+                likelihood(alpha, b, B_bias, sigma, Gamma) * prior[k]
+                for k, b in enumerate(B_grid)
+            ]
+        )
         post /= simpson(post, B_grid)
         KL_vals.append(KL_divergence(post, prior, B_grid))
         P_alpha.append(P_alpha_val)

@@ -22,7 +22,7 @@ __author__ = "Pranav Agrawal"
 
 __all__ = [
     "alpha_theory",
-    "likelihood", 
+    "likelihood",
     "update_posterior",
     "KL_divergence",
     "expected_KL",

@@ -25,7 +25,9 @@ def test_alpha_theory_properties():
     assert np.all(np.abs(vals) <= max_bound + 1e-12)
 
     # maximum at B = Gamma gives exactly 1/(2*Gamma)
-    assert math.isclose(alpha_theory(Gamma, Gamma), max_bound, rel_tol=1e-12, abs_tol=1e-12)
+    assert math.isclose(
+        alpha_theory(Gamma, Gamma), max_bound, rel_tol=1e-12, abs_tol=1e-12
+    )
 
 
 def test_likelihood_matches_gaussian_peak():

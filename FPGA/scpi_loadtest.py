@@ -3,10 +3,10 @@ import time
 import statistics
 
 # --- Configuration ---
-HOST = "rp-f0b172.local"   # replace with your PID/SCPI device hostname or IP
-PORT = 5000                # SCPI port (5025 is common, check your device)
-COMMAND = "*IDN?\n"        # simple SCPI query
-N_REQUESTS = 1000          # number of iterations
+HOST = "rp-f0b172.local"  # replace with your PID/SCPI device hostname or IP
+PORT = 5000  # SCPI port (5025 is common, check your device)
+COMMAND = "*IDN?\n"  # simple SCPI query
+N_REQUESTS = 1000  # number of iterations
 # -----------------------
 
 latencies = []

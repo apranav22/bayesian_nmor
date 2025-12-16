@@ -7,7 +7,7 @@ A research project implementing Bayesian inference approaches for Nonlinear Magn
 This project combines theoretical Bayesian inference methods with practical hardware implementation to optimize magnetic field measurements using nonlinear magneto-optical rotation (NMOR). The system uses adaptive experimental design to iteratively select optimal bias fields that maximize information gain about unknown magnetic fields.
 
 ## Project Structure
-
+ji
 ```
 bayesian_nmor/
 ├── BayesianNMOR/              # Core Bayesian inference implementation

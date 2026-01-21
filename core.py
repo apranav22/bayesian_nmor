@@ -6,55 +6,127 @@ import matplotlib.pyplot as plt
 import cupy as cp
 import time
 from datetime import datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping, Optional
 from scipy.interpolate import RegularGridInterpolator
 from matplotlib.ticker import MaxNLocator
 
 # Data loading
+@dataclass
 class DataContext: 
     """Bundle of file strings that allow loading of the data we are interested in. 
-    Attrs: 
-    1. sim_time: Path to simulation time axis csv file.
-    2. sim_freq: Path to simulation frequency axis csv file.
-    3. sim_by: Path to simulation By axis csv file.
-    4. 
+    
+    Stores paths to simulation and experiment data, interpolator cache, and handles
+    timestamped result directories.
+    
+    Attrs:
+    - sim_time: Path to simulation time axis csv file
+    - sim_freq: Path to simulation frequency axis csv file
+    - sim_by: Path to simulation By axis csv file
+    - sim_intensities: List of simulation intensity file paths
+    - exp_time: Path to experiment time axis csv file
+    - exp_freq_axis: Path to experiment frequency bias axis csv file
+    - exp_data: Path to experiment probe transmission data csv file
+    - interpolator: Path to cached interpolator pickle file (or None)
+    - save_path: Base directory for results (timestamped subdirectory auto-created)
+    """
+    sim_time: str
+    sim_freq: str
+    sim_by: str
+    sim_intensities: list[str]
+    exp_time: str
+    exp_freq_axis: str
+    exp_data: str
+    save_path: str
+    interpolator: Optional[str]
 
-    5. exp_time:
-    6. exp_freq_axis:
-    7. exp_data
+    def __post_init__(self):
+        """Generate timestamped save directory and create it."""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        object.__setattr__(self, 'save_path', os.path.join(self.save_path, timestamp))
+        os.makedirs(self.save_path, exist_ok=True)
 
-    8. Interpolator path: if does not exist, fallback how?
-    9. save path? implement the code to generate test ID subfolders. 
 
-    This does not do any loading. Only stores the paths, so that the loader can call the file paths.
+@dataclass(frozen=True)
+class ParameterContext:
+    """Bundle of runtime parameters for experiments and alt-opt runs.
+
+    This centralizes commonly used knobs with sensible defaults so you can
+    pass one object around instead of many separate arguments.
+
+    Longitudinal/Y Estimation (common):
+    - curr_time: Start time (s)
+    - print_plot: Whether to show intermediate plots
+    - zoom_factor: Adaptive zoom factor (> 1)
+    - max_time: End time (s)
+    - t_step: Measurement step (s)
+    - B_unk_bound: Prior bound for unknown field (|B| <= bound)
+    - init_resolution: Initial grid resolution
+    - sigma_noise: Observation noise stddev
+    - f_bias_offset_nuisance: Constant offset added to exp bias axis (Z only)
+
+    AltOpt-only:
+    - num_iter: Alternating optimization iterations
+    - tol_bz / tol_by: early-stop tolerances
+    - patience: consecutive stable iterations required to early-stop
+    - Est_First_Z: whether to estimate Z first
+    - fixed_bz_estimate / fixed_by_estimate: initial seeds
     """
 
-    def __init__(
-        self,
-        sim_time: str,
-        sim_freq: str,
-        sim_by: str,
-        sim_intensities: list[str],
-        exp_time: str,
-        exp_freq_axis: str,
-        exp_data: str,
-        save_path: str,
-        interpolator: Optional[str]
-    ):
-        self.sim_time = sim_time
-        self.sim_freq = sim_freq
-        self.sim_by = sim_by
-        # self.sim_intensities = sim_intensities  #
+    # Common experiment parameters
+    curr_time: float = 5.0
+    print_plot: bool = False
+    zoom_factor: float = 1.5
+    zoom_trigger_multiple: int = 400
+    zoom_trigger_ratio: float = 0.2
+    max_time: float = 30.0
+    t_step: float = 0.2
+    B_unk_bound: float = 1.0
+    init_resolution: float = 0.00025
+    sigma_noise: float = 0.05
+    f_bias_offset_nuisance: float = 0.0
 
-        self.exp_time = exp_time
-        self.exp_freq_axis = exp_freq_axis
-        self.exp_data = exp_data
+    # Pulse parameters
+    sim_pulse_thresh: float = 0.2
+    exp_pulse_thresh: float = 0.2
+    
+    # Adaptive experiment/grid
+    kl_y_grid_size: int = 100
 
-        self.interpolator = interpolator
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.save_path = os.path.join(save_path, timestamp)
-        os.makedirs(self.save_path, exist_ok=True)
+    # AltOpt parameters
+    num_iter: int = 5
+    tol_bz: float = 1e-4
+    tol_by: float = 1e-4
+    patience: int = 2
+
+    Est_First_Z: bool = True
+    fixed_bz_estimate: float = 0.0
+    fixed_by_estimate: float = 0.0
+
+    def validate(self) -> tuple[bool, list[str]]:
+        """Basic parameter sanity checks.
+
+        Returns (ok, problems). Problems contains human-readable strings.
+        """
+        problems: list[str] = []
+        if self.zoom_factor <= 1.0:
+            problems.append("zoom_factor must be > 1.0")
+        if self.t_step <= 0:
+            problems.append("t_step must be > 0")
+        if self.max_time <= self.curr_time:
+            problems.append("max_time must be > curr_time")
+        if self.B_unk_bound <= 0:
+            problems.append("B_unk_bound must be > 0")
+        if self.init_resolution <= 0:
+            problems.append("init_resolution must be > 0")
+        if self.sigma_noise < 0:
+            problems.append("sigma_noise must be >= 0")
+        if self.num_iter <= 0:
+            problems.append("num_iter must be > 0")
+        if self.patience < 1:
+            problems.append("patience must be >= 1")
+        return (len(problems) == 0, problems)
+
 
 # default object: 
 DATA_DIR = r"DataFiles_to_Dinesh_Pranav\Data_files\Simulation\Dataset_3"
@@ -69,6 +141,9 @@ DATASET3 = DataContext(
     save_path = r"Results\Dataset_3",
     interpolator=r"DataFiles_to_Dinesh_Pranav\Data_files\Simulation\Dataset_3\sim_interpolator.pkl"
 )
+
+DEFAULT_PARAMS = ParameterContext()
+
 ## Preprocessing
 def find_pulse_start(trace, t_axis, threshold):
     idx = np.where(trace > threshold)[0]
@@ -77,13 +152,13 @@ def find_pulse_start(trace, t_axis, threshold):
     return t_axis[0], 0
 
 
-def load_simulation_cube(config):
-    # config is a dictionary with keys: 'time', 'freq', 'by_vals', 'intensities'
+def load_simulation_cube(config: DataContext):
+    """Load simulation axes and cube using DataContext paths."""
     print("...Loading Simulation Cube Data...")
     to = time.time()
-    t_axis = pd.read_csv(config["time"], header=None).values.flatten()
-    f_axis = pd.read_csv(config["freq"], header=None).values.flatten()
-    by_axis = pd.read_csv(config["by_vals"], header=None).values.flatten()
+    t_axis = pd.read_csv(config.sim_time, header=None).values.flatten()
+    f_axis = pd.read_csv(config.sim_freq, header=None).values.flatten()
+    by_axis = pd.read_csv(config.sim_by, header=None).values.flatten()
 
     print(
         f"  > Axes Loaded: Time[{len(t_axis)}], Freq[{len(f_axis)}], By[{len(by_axis)}]"
@@ -91,7 +166,7 @@ def load_simulation_cube(config):
 
     t_sim_0, _ = 0.0, 0
     matrix_list = []
-    for fname in config["intensities"]:
+    for fname in config.sim_intensities:
         data = pd.read_csv(fname, header=None).values
 
         if data.shape != (len(t_axis), len(f_axis)):
@@ -749,35 +824,21 @@ def calculate_summary_stats(posterior, B_grid):
 
 def run_experiment_longitudinal_estimation(
     config: DataContext,
-    fixed_by_estimate=0.0,
-    curr_time=5.0,
-    print_plot=False,
-    zoom_factor=1.5,
-    max_time=30.0,
-    t_step=0.2,
-    B_unk_bound=1.0,
-    init_resolution=0.00025,
-    sigma_noise=0.05,
-    f_bias_offset_nuisance=0.0,
-    
+    params: ParameterContext,
+    fixed_by_estimate: float = 0.0,
 ):
     print("Starting Adaptive Experiment...")
-    # Load Data
-    # t_sim, f_sim, sim_spline = load_simulation(SIM_FILES_Longitudinal_Estimation)
+    time_cursor = params.curr_time
+
     t_sim, f_sim, by_sim, sim_spline = get_final_interpolator(config)
     t_exp, f_bias_axis, exp_matrix = load_experiment(config)
-    f_bias_axis += f_bias_offset_nuisance
+    f_bias_axis += params.f_bias_offset_nuisance
 
-    # Initialization of Grid
-    b_grid_gpu = cp.arange(-B_unk_bound, B_unk_bound, init_resolution)  # type: ignore
-    curr_res = init_resolution
-    # Posterior (Uniform Density)
-    # PDF = 1 / (Max - Min)
-    pdf_val = 1.0 / (2 * B_unk_bound)
+    b_grid_gpu = cp.arange(-params.B_unk_bound, params.B_unk_bound, params.init_resolution)  # type: ignore
+    curr_res = params.init_resolution
+    pdf_val = 1.0 / (2 * params.B_unk_bound)
     posterior_gpu = cp.full_like(b_grid_gpu, pdf_val)
 
-    # State
-    # initial data is not nice, hence we are starting after about 5 seconds beyond which the data looks very nice
     curr_bias = 0.0
 
     history = {
@@ -795,31 +856,24 @@ def run_experiment_longitudinal_estimation(
 
     start_wall = time.time()
 
-    # 4. Loop
-    while curr_time < max_time:
-        # A. Measure
-        t_next = curr_time + t_step
-        t_start_abs = curr_time
+    while time_cursor < params.max_time:
+        t_next = time_cursor + params.t_step
+        t_start_abs = time_cursor
         t_end_abs = t_next
 
-        # Find indices in Exp Matrix
         idx_start = np.searchsorted(t_exp, t_start_abs)
         idx_end = np.searchsorted(t_exp, t_end_abs)
 
-        # FIXME: we can pass candidates array as the f_bias_axis, and that makes sense as far as this data is concerned, fix this after verifying KL divergence
         bias_idx = (np.abs(f_bias_axis - curr_bias)).argmin()
 
         if idx_start >= idx_end:
-            break  # End of data
+            break
 
         y_obs = exp_matrix[idx_start:idx_end, bias_idx]
         t_chunk_exp = t_exp[idx_start:idx_end]
-
-        # Posterior Update
-        # Map Exp Time -> Sim Time
         t_sim_eval = t_chunk_exp
 
-        if print_plot:
+        if params.print_plot:
             plt.plot(b_grid_gpu.get(), posterior_gpu.get())
             plt.show()
 
@@ -830,24 +884,28 @@ def run_experiment_longitudinal_estimation(
             fixed_by_estimate,
             b_grid_gpu,
             sim_spline,
-            sigma=sigma_noise,
+            sigma=params.sigma_noise,
         )
 
         posterior_gpu *= likelihood
         norm = cp.trapz(posterior_gpu, x=b_grid_gpu)
         posterior_gpu /= norm
 
-        if print_plot:
+        if params.print_plot:
             plt.plot(b_grid_gpu.get(), posterior_gpu.get())
             plt.show()
 
-        # Adaptive Zoom
         posterior_gpu, b_grid_gpu, curr_res = check_and_apply_zoom(
-            posterior_gpu, b_grid_gpu, curr_res, zoom_factor
+            posterior_gpu,
+            b_grid_gpu,
+            curr_res,
+            zoom_factor=params.zoom_factor,
+            zoom_trigger_multiple=params.zoom_trigger_multiple,
+            zoom_trigger_ratio=params.zoom_trigger_ratio,
+            initial_resolution=params.init_resolution,
+            B_unk_bound=params.B_unk_bound,
         )
 
-        # Record
-        # MAP Estimate
         mode, stddev = calculate_summary_stats(posterior_gpu, b_grid_gpu)
 
         history["time"].append(t_next)
@@ -864,9 +922,8 @@ def run_experiment_longitudinal_estimation(
             end=" ",
         )
 
-        # Adapt Control
         t_fut_1 = np.float64(t_next)
-        t_fut_2 = np.float64(t_next + t_step)
+        t_fut_2 = np.float64(t_next + params.t_step)
 
         next_bias, expectedkl = calculate_kl_divergence_gpu(
             posterior_gpu,
@@ -881,7 +938,7 @@ def run_experiment_longitudinal_estimation(
 
         history["expectedkl"].append(expectedkl.get())
         curr_bias = next_bias
-        curr_time = t_next
+        time_cursor = t_next
 
     history_longitudinal_estimation = {
         "time": np.array(history["time"]),
@@ -899,7 +956,7 @@ def run_experiment_longitudinal_estimation(
         f"{config.save_path}/longitudinal_estimation_results_{ts}.npz",
         **history_longitudinal_estimation,
     )
-    print(f"Results for Test saved successfully.", end=" ")
+    print("Results for Test saved successfully.", end=" ")
 
     print("\n", f"Done in {time.time() - start_wall:.2f}s")
     return history
@@ -1092,25 +1149,18 @@ def check_and_apply_zoom_by(
 
 def run_experiment_y_estimation(
     config: DataContext,
-    Test=0,
-    fixed_bz_estimate=0.0,
-    curr_time=5.0,
-    print_plot=False,
-    zoom_factor=1.5,
-    init_resolution=0.00025,
-    max_time=30.0,
-    t_step=0.2,
-    B_unk_bound=1.0,
-    sigma_noise=0.05,
+    params: ParameterContext,
+    fixed_bz_estimate: float = 0.0,
 ):
-    # ! rewrite this args to use the DataContext for file paths and saving results
 
     print("...Starting Adaptive Experiment for Y Estimation...")
+    time_cursor = params.curr_time
+
     t_exp, f_bias_axis, exp_matrix = load_experiment(config)
     t_sim, f_sim, by_sim, sim_interp = get_final_interpolator(config)
 
-    b_grid_gpu = cp.arange(-B_unk_bound, B_unk_bound, init_resolution)  # type: ignore
-    curr_res = init_resolution
+    b_grid_gpu = cp.arange(-params.B_unk_bound, params.B_unk_bound, params.init_resolution)  # type: ignore
+    curr_res = params.init_resolution
 
     posterior_gpu = cp.ones_like(b_grid_gpu)
     posterior_gpu /= cp.sum(posterior_gpu) * curr_res
@@ -1132,9 +1182,9 @@ def run_experiment_y_estimation(
 
     start_wall = time.time()
 
-    while curr_time < max_time:
-        t_next = curr_time + t_step
-        t_abs_start = curr_time
+    while time_cursor < params.max_time:
+        t_next = time_cursor + params.t_step
+        t_abs_start = time_cursor
         t_abs_end = t_next
         idx_start = np.searchsorted(t_exp, t_abs_start)
         idx_end = np.searchsorted(t_exp, t_abs_end)
@@ -1148,7 +1198,7 @@ def run_experiment_y_estimation(
 
         by_grid_cpu = cp.asnumpy(b_grid_gpu)
 
-        if print_plot:
+        if params.print_plot:
             plt.plot(b_grid_gpu.get(), posterior_gpu.get())  # type: ignore
             plt.show()
 
@@ -1158,11 +1208,11 @@ def run_experiment_y_estimation(
             curr_bias_z,
             by_grid_cpu,
             sim_interp,
-            sigma=sigma_noise,
+            sigma=params.sigma_noise,
             fixed_bz_estimate=fixed_bz_estimate,
         )
 
-        if print_plot:
+        if params.print_plot:
             plt.plot(b_grid_gpu.get(), posterior_gpu.get())  # type: ignore
             plt.show()
 
@@ -1171,7 +1221,14 @@ def run_experiment_y_estimation(
         posterior_gpu /= norm
 
         posterior_gpu, b_grid_gpu, curr_res = check_and_apply_zoom_by(
-            posterior_gpu, b_grid_gpu, curr_res, zoom_factor
+            posterior_gpu,
+            b_grid_gpu,
+            curr_res,
+            zoom_factor=params.zoom_factor,
+            zoom_trigger_multiple=params.zoom_trigger_multiple,
+            zoom_trigger_ratio=params.zoom_trigger_ratio,
+            b_y_bounds=(-params.B_unk_bound, params.B_unk_bound),
+            initial_resolution=params.init_resolution,
         )
 
         mode, stddev = calculate_summary_stats(posterior_gpu, b_grid_gpu)
@@ -1189,7 +1246,7 @@ def run_experiment_y_estimation(
         )
 
         t_fut_1 = np.float64(t_next)
-        t_fut_2 = np.float64(t_next + t_step)
+        t_fut_2 = np.float64(t_next + params.t_step)
 
         next_bias, expectedkl = calculate_kl_by(
             posterior_gpu, b_grid_gpu, sim_interp, t_fut_1, t_fut_2, f_bias_axis
@@ -1197,7 +1254,7 @@ def run_experiment_y_estimation(
 
         history["expectedkl"].append(expectedkl.get())
         curr_bias_z = next_bias
-        curr_time = t_next
+        time_cursor = t_next
 
     history_y_estimation = {
         "time": np.array(history["time"]),
@@ -1221,46 +1278,49 @@ def run_experiment_y_estimation(
 
 
 def altopt(
-    config, 
-    num_iter=5,
-    max_time=30,
-    curr_time=0,
-    t_step=0.2,
-    tol_bz=1e-4,
-    tol_by=1e-4,
-    patience=2,
-    Est_First_Z=True,
-    fixed_bz_estimate=0.0,
-    fixed_by_estimate=0.0,
+    config: DataContext, 
+    params: ParameterContext,
 ):
     # ! load these arguments using some parameter context. 
+    num_iter = params.num_iter
+    max_time = params.max_time
+    curr_time = params.curr_time
+    t_step = params.t_step
+    tol_bz = params.tol_bz
+    tol_by = params.tol_by
+    patience = params.patience
+    Est_First_Z = params.Est_First_Z
+    fixed_bz_estimate = params.fixed_bz_estimate
+    fixed_by_estimate = params.fixed_by_estimate
     if Est_First_Z:
         bz_history = []
-        by_history = []
+        by_history = [fixed_by_estimate]
         stable_bz_runs = 0
         stable_by_runs = 0
 
-        # Initial Bz estimation (start with fixed_by_estimate = 0.0)
-        fixed_by_estimate = 0.0
-        by_history.append(fixed_by_estimate)
+        # Initial Bz estimation using current By seed
+        current_by = fixed_by_estimate
+        by_history.append(current_by)
         results = run_experiment_longitudinal_estimation(
-            config, 
-            fixed_by_estimate=fixed_by_estimate,
-            curr_time=curr_time,
-            max_time=max_time,
-            t_step=t_step,
+            config,
+            params,
+            fixed_by_estimate=current_by,
         )
-        fixed_bz_estimate = results["est"][-1]
-        bz_history.append(fixed_bz_estimate)
-        print(f"Estimated Bz: {fixed_bz_estimate}")
+        current_bz = results["est"][-1]
+        bz_history.append(current_bz)
+        print(f"Estimated Bz: {current_bz}")
 
         for i in range(num_iter):
             # Estimate By given current Bz
-            results_by = run_experiment_y_estimation(config, fixed_bz_estimate, curr_time)
+            results_by = run_experiment_y_estimation(
+                config,
+                params,
+                fixed_bz_estimate=current_bz,
+            )
             new_by = results_by["est"][-1]
 
             # UPDATE THE GLOBAL BY ESTIMATE
-            fixed_by_estimate = new_by
+            current_by = new_by
 
             # Early-stop tracking for By
             if by_history and abs(new_by - by_history[-1]) <= tol_by:
@@ -1271,11 +1331,15 @@ def altopt(
             print(f"Estimated By: {new_by} (stable {stable_by_runs}/{patience})")
 
             # Re-estimate Bz given new By
-            results = run_experiment_longitudinal_estimation(config, new_by, print_plot=False)
+            results = run_experiment_longitudinal_estimation(
+                config,
+                params,
+                fixed_by_estimate=current_by,
+            )
             new_bz = results["est"][-1]
 
             # UPDATE THE GLOBAL BZ ESTIMATE
-            fixed_bz_estimate = new_bz
+            current_bz = new_bz
 
             # Early-stop tracking for Bz
             if abs(new_bz - bz_history[-1]) <= tol_bz:
@@ -1295,28 +1359,33 @@ def altopt(
         return bz_history, by_history
 
     else:
-        bz_history = []
+        bz_history = [fixed_bz_estimate]
         by_history = []
         stable_bz_runs = 0
         stable_by_runs = 0
 
-        # Initial By estimation (start with fixed_bz_estimate = 0.0)
-        fixed_bz_estimate = 0.0
-        results = run_experiment_y_estimation(config, 0, fixed_bz_estimate, curr_time)
-        print(results)
-        fixed_by_estimate = results["est"][-1]
-        by_history.append(fixed_bz_estimate)
-        print(f"Estimated By: {fixed_by_estimate}")
+        # Initial By estimation using current Bz seed
+        current_bz = fixed_bz_estimate
+        results = run_experiment_y_estimation(
+            config,
+            params,
+            fixed_bz_estimate=current_bz,
+        )
+        current_by = results["est"][-1]
+        by_history.append(current_by)
+        print(f"Estimated By: {current_by}")
 
         for i in range(num_iter):
             # Estimate By given current Bz
             results_bz = run_experiment_longitudinal_estimation(
-                config, fixed_by_estimate, curr_time
+                config,
+                params,
+                fixed_by_estimate=current_by,
             )
             new_bz = results_bz["est"][-1]
 
             # UPDATE THE GLOBAL BY ESTIMATE
-            fixed_bz_estimate = new_bz
+            current_bz = new_bz
 
             # Early-stop tracking for By
             if bz_history and abs(new_bz - bz_history[-1]) <= tol_bz:
@@ -1327,11 +1396,15 @@ def altopt(
             print(f"Estimated By: {new_bz} (stable {stable_bz_runs}/{patience})")
 
             # Re-estimate Bz given new By
-            results = run_experiment_y_estimation(config, new_bz, print_plot=False)
+            results = run_experiment_y_estimation(
+                config,
+                params,
+                fixed_bz_estimate=current_bz,
+            )
             new_by = results["est"][-1]
 
             # UPDATE THE GLOBAL BZ ESTIMATE
-            fixed_by_estimate = new_by
+            current_by = new_by
 
             # Early-stop tracking for Bz
             if abs(new_by - by_history[-1]) <= tol_by:
@@ -1361,19 +1434,27 @@ def plot_altopt(config, bz_history, by_history, trajectory_mode=True):
     plt.subplot(1, 3, 1)
     plt.plot(iterations_bz, bz_history, marker="o")
     plt.title("Convergence of Bz Estimates")
+    plt.xlabel("Iteration")
+    plt.ylabel("Bz")
+    plt.grid(True, alpha=0.3)
 
     # Plot for By
     plt.subplot(1, 3, 2)
     plt.plot(iterations_by, by_history, marker="o")
     plt.title("Convergence of By Estimates")
+    plt.xlabel("Iteration")
+    plt.ylabel("By")
+    plt.grid(True, alpha=0.3)
 
     # Trajectory Plot
     if trajectory_mode:
         plt.subplot(1, 3, 3)
+
         plt.plot(by_history, bz_history, marker="o")
         plt.title("Trajectory of Estimates in By-Bz Space")
         plt.xlabel("By Estimates")
         plt.ylabel("Bz Estimates")
+        plt.grid(True, alpha=0.3)
         for idx, (by, bz) in enumerate(zip(by_history, bz_history), start=0):
             plt.annotate(
                 str(idx),
@@ -1382,7 +1463,6 @@ def plot_altopt(config, bz_history, by_history, trajectory_mode=True):
                 xytext=(5, 5),
                 fontsize=8,
             )
-    # ! write code to save plots to some directory specified in config
     plt.suptitle("AltOpt Convergence and Trajectory", fontsize=16)
     plt.tight_layout()
     plt.show()
@@ -1397,6 +1477,8 @@ def test_altopt_sweep(
     tol_bz=1e-4,
     tol_by=1e-4,
     patience=3,
+    *,
+    params: ParameterContext,
 ):
     """
     Run altopt for different combinations of T_STEP and initial By estimate.
@@ -1410,16 +1492,19 @@ def test_altopt_sweep(
             print(f"Testing: T_STEP={t_step}, Initial By={by_init}")
             print(f"{'=' * 60}")
             try:
-                bz_hist, by_hist = altopt(
-                    config, 
-                    num_iter=num_iter,
-                    max_time=max_time,
-                    curr_time=0,
+                params_run = replace(
+                    params,
                     t_step=t_step,
+                    fixed_by_estimate=by_init,
+                    max_time=max_time,
+                    num_iter=num_iter,
                     tol_bz=tol_bz,
                     tol_by=tol_by,
                     patience=patience,
-                    fixed_by_estimate=by_init,
+                )
+                bz_hist, by_hist = altopt(
+                    config, 
+                    params_run,
                 )  # type: ignore
                 results.append(
                     {
@@ -1544,3 +1629,7 @@ def plot_altopt_first3_combined(results, config):
     print("Saved:", outpath)
 
     plt.show()
+
+
+if __name__ == "__main__":
+    pass

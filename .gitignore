@@ -1,11 +1,12 @@
 .ruff_cache/
 Tests/
+Results/
 DataFiles_to_Dinesh_Pranav.zip
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
 *$py.class
-
+FPGA/
 # C extensions
 *.so
 *.pkl

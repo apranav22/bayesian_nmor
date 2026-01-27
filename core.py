@@ -39,15 +39,19 @@ class DataContext:
     exp_data: str
     save_path: str
     interpolator: Optional[str]
+    Aligned: bool = False
+    # Pulse parameters
+    sim_pulse_thresh: float = 0.25
+    exp_pulse_thresh: float = 0.2
 
     def __post_init__(self):
         """Generate timestamped save directory and create it."""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        object.__setattr__(self, 'save_path', os.path.join(self.save_path, timestamp))
+        timestamp = datetime.now().date().strftime("%Y_%m_%d")
+        object.__setattr__(self, 'save_path', os.path.join(self.save_path, f'Test_{timestamp}'))
         os.makedirs(self.save_path, exist_ok=True)
 
 
-@dataclass(frozen=True)
+@dataclass
 class ParameterContext:
     """Bundle of runtime parameters for experiments and alt-opt runs.
 
@@ -81,14 +85,16 @@ class ParameterContext:
     zoom_trigger_ratio: float = 0.2
     max_time: float = 30.0
     t_step: float = 0.2
-    B_unk_bound: float = 1.0
+    B_unk_bound_longitudinal: float = 1.0
+    B_unk_bound_transverse_lower: float = 0.0
+    B_unk_bound_transverse_upper: float = 0.5
     init_resolution: float = 0.00025
-    sigma_noise: float = 0.05
+    sigma_noise_longitudinal: float = 0.05
+    sigma_noise_transverse: float = 0.1
     f_bias_offset_nuisance: float = 0.0
+    Test: str = f"Starting with {curr_time} us_T Step {t_step} us"
 
-    # Pulse parameters
-    sim_pulse_thresh: float = 0.2
-    exp_pulse_thresh: float = 0.2
+    #FIXME: T_STEP and sigma_noise must be set such that the variable list of inputs are also accepted
     
     # Adaptive experiment/grid
     kl_y_grid_size: int = 100
@@ -129,6 +135,8 @@ class ParameterContext:
 
 
 # default object: 
+DEFAULT_PARAMS = ParameterContext()
+
 DATA_DIR = r"DataFiles_to_Dinesh_Pranav\Data_files\Simulation\Dataset_3"
 DATASET3 = DataContext(
     sim_time = os.path.join(DATA_DIR, "t_array.csv"),
@@ -139,10 +147,11 @@ DATASET3 = DataContext(
     exp_freq_axis = r"DataFiles_to_Dinesh_Pranav\Data_files\Experiment\Y_MHz_Exp.csv",
     exp_data = r"DataFiles_to_Dinesh_Pranav\Data_files\Experiment\Probe_trans_Exp.csv",
     save_path = r"Results\Dataset_3",
-    interpolator=r"DataFiles_to_Dinesh_Pranav\Data_files\Simulation\Dataset_3\sim_interpolator.pkl"
+    interpolator=r"DataFiles_to_Dinesh_Pranav\Data_files\Simulation\Dataset_3\sim_interpolator.pkl",
+    Aligned = True
 )
 
-DEFAULT_PARAMS = ParameterContext()
+
 
 ## Preprocessing
 def find_pulse_start(trace, t_axis, threshold):
@@ -175,7 +184,7 @@ def load_simulation_cube(config: DataContext):
             scale = 1 / (np.max(data) - np.min(data))
             calibrated_data = (data - np.min(data)) * scale
             calibrated_data = np.clip(calibrated_data, 0.0, 1.0)
-            t_sim_0, _ = find_pulse_start(calibrated_data[:, 0], t_axis, 0.25)
+            t_sim_0, _ = find_pulse_start(calibrated_data[:, 0], t_axis, config.sim_pulse_thresh)
 
             t_axis_0 = t_axis[_:] - t_sim_0
 
@@ -192,7 +201,7 @@ def load_simulation_cube(config: DataContext):
     return t_axis_0, f_axis, by_axis, cube
 
 
-def load_experiment(config: DataContext, Aligned=False):
+def load_experiment(config: DataContext, Aligned=DATASET3.Aligned):
     to = time.time()
     print(f"Loading Experiment from {config.exp_data}...")
     t = pd.read_csv(config.exp_time, header=None).values.flatten()
@@ -206,14 +215,15 @@ def load_experiment(config: DataContext, Aligned=False):
         scale = 1 / (np.max(raw_data) - np.min(raw_data))
         calibrated_data = (raw_data - np.min(raw_data)) * scale
         calibrated_data = np.clip(calibrated_data, 0.0, 1.0)
-        t_exp_0, __ = find_pulse_start(calibrated_data[:, 0], t, 0.2)
+        t_exp_0, __ = find_pulse_start(calibrated_data[:, 0], t, config.exp_pulse_thresh)
 
         t = t[__:] - t_exp_0
         raw_data = raw_data[__:,]
-    # calibrated_data= calibration(raw_data, np.min(raw_data), np.max(raw_data))
-    print(f"  > Exp Start: {t_exp_0:.4f}s")
+        print(f"  > Exp Start: {t_exp_0:.4f}s")
+    calibrated_data= calibration(raw_data, np.min(raw_data), np.max(raw_data))
+   
     print(time.time() - to, "was the time taken to load exp data.")
-    return t, f_bias, calibrated_data[__:,]
+    return t, f_bias, calibrated_data
 
 
 def calibration(data, v_dark, v_max):
@@ -291,7 +301,7 @@ def plot_slice(by_idx, file_path):
     # interpolator and interpolation validator for Y field estimation
 
 
-def get_final_interpolator(config: Optional[DataContext]):
+def get_final_interpolator(config: Optional[DataContext], params: ParameterContext):
     # if the config DataContext stringblob has an interpolator path, use that to load the interpolator otherwise generate.
     print("...Building Final Interpolator...")
     if not os.path.exists(config.interpolator):
@@ -420,7 +430,7 @@ def validate_interpolator(t, f, by, cube, time_idx=-1):
 
 # Likelihood and KL for Longtudinal Estimation
 def calculate_likelihood_gpu(
-    y_meas, t_sim_abs, current_bias, y_grid, b_grid_gpu, sim_spline, sigma
+    y_meas, t_sim_abs, current_bias, y_grid, b_grid_gpu, sim_spline, sigma_noise = DEFAULT_PARAMS.sigma_noise_longitudinal
 ):
     to = time.time()
     b_grid_cpu = cp.asnumpy(b_grid_gpu)
@@ -430,16 +440,15 @@ def calculate_likelihood_gpu(
         get_predictions_batch(sim_spline, t_sim_abs, f_total_query, y_grid)
     )
     y_meas_gpu = cp.asarray(y_meas)
-
     resid_sq = (y_meas_gpu[:, None] - y_theory_gpu) ** 2
     sse = cp.sum(resid_sq, axis=0)
-
-    log_L = -sse / (2 * sigma**2)
+    log_L = -sse / (2 * sigma_noise**2)
     del y_theory_gpu, y_meas_gpu, resid_sq
     cp.get_default_memory_pool().free_all_blocks()
+    if cp.any(cp.isnan(log_L)):
+        print("NaNs detected in Likelihood!")
     print(time.time() - to, "was the time taken to compute the likelihood.|", end=" ")
-    # return cp.exp(log_L - cp.max(log_L))
-    return cp.exp(log_L)
+    return cp.exp(log_L - cp.max(log_L))
 
 
 def calculate_kl_divergence_gpu(
@@ -452,7 +461,7 @@ def calculate_kl_divergence_gpu(
     candidate_biases,
     batch_size=10,
     y_grid_size=50,
-    sigma_noise=0.05,
+    sigma_noise=DEFAULT_PARAMS.sigma_noise_longitudinal
 ):
     to = time.time()
     b_grid_cpu = cp.asnumpy(b_grid_gpu)
@@ -513,8 +522,8 @@ def calculate_likelihood_by(
     current_bias_z,
     by_grid_cpu,
     sim_interp,
-    sigma,
-    fixed_bz_estimate,
+    sigma_noise=DEFAULT_PARAMS.sigma_noise_transverse,
+    fixed_bz_estimate=DEFAULT_PARAMS.fixed_bz_estimate
 ):
     z_total = fixed_bz_estimate + current_bias_z
     y_pred_cpu = get_predictions_batch(sim_interp, t_chunk_sim, z_total, by_grid_cpu)
@@ -524,7 +533,7 @@ def calculate_likelihood_by(
 
     resid_sq = (y_meas_gpu[:, None] - y_pred_gpu) ** 2
     sse = cp.sum(resid_sq, axis=0)
-    log_L = -sse / (2 * sigma**2)
+    log_L = -sse / (2 * sigma_noise**2)
     del y_pred_gpu, y_meas_gpu, resid_sq
     cp.get_default_memory_pool().free_all_blocks()
     return cp.exp(log_L - cp.max(log_L))
@@ -539,8 +548,8 @@ def calculate_kl_by(
     candidate_biases_z,
     batch_size=20,
     y_grid_size=50,
-    sigma_noise=0.05,
-    fixed_bz_estimate=0.0,
+    sigma_noise=DEFAULT_PARAMS.sigma_noise_transverse,
+    fixed_bz_estimate=DEFAULT_PARAMS.fixed_bz_estimate,
 ):
     t_start = time.time()
     t_mid = (t_next_start + t_next_end) / 2.0
@@ -587,7 +596,7 @@ def calculate_kl_by(
     return best_bias, expected_kl
 
 
-# zoom and summary stats
+# zoom and summary stats - need to replace these values from parameter context FIXME
 def check_and_apply_zoom(
     posterior_gpu: cp.ndarray,
     b_grid_gpu: cp.ndarray,
@@ -596,10 +605,10 @@ def check_and_apply_zoom(
     zoom_trigger_multiple: int = 400,
     zoom_trigger_ratio: float = 0.2,
     initial_resolution=0.00025,
-    B_unk_bound=1,
+    B_unk_bound_longitudinal=1,
 ) -> tuple:
     # compute B_unk range
-    B_unk_init_range = (-B_unk_bound, B_unk_bound)
+    B_unk_init_range = (-B_unk_bound_longitudinal, B_unk_bound_longitudinal)
 
     # PDF -> CDF
     to = time.time()
@@ -608,7 +617,7 @@ def check_and_apply_zoom(
     pdf_mass[:-1] = posterior_gpu[:-1] * dB
     pdf_mass[-1] = posterior_gpu[-1] * dB[-1]
     cdf = cp.cumsum(pdf_mass)
-    cdf /= cdf[-1]  # Ensure it ends exactly at 1.0
+    cdf = cdf/cdf[-1]  # Ensure it ends exactly at 1.0
 
     # Finding region where majority of the probability is concentrated
     # i have added this for loop for debugging
@@ -634,8 +643,8 @@ def check_and_apply_zoom(
     if new_res <= 0:
         print("new_res:", cp.min(new_res))
         raise ValueError("Resolution is less than zero")
-    new_b_grid_gpu = b_grid_gpu
-    new_posterior_gpu = posterior_gpu
+    new_b_grid_gpu = cp.copy(b_grid_gpu)
+    new_posterior_gpu = cp.copy(posterior_gpu)
     del b_grid_gpu, posterior_gpu
     cp.get_default_memory_pool().free_all_blocks()
 
@@ -645,16 +654,17 @@ def check_and_apply_zoom(
             > (new_b_grid_gpu[idx_99] - new_b_grid_gpu[idx_01])
         )
         or width_idx < 100
-        or len(new_b_grid_gpu) >= 15000
+        or len(new_b_grid_gpu) >= 20000
     ):
+        zoom_index = 0
         while (
             (
                 (new_res * zoom_trigger_multiple)
                 > (new_b_grid_gpu[idx_99] - new_b_grid_gpu[idx_01])
             )
             or width_idx < 100
-            or len(new_b_grid_gpu) >= 15000
-        ):
+            or len(new_b_grid_gpu) >= 20000
+        ) and zoom_index < 5:
             print(
                 f"  [ZOOM] Triggered! Mass concentrated in {width_idx} points.|",
                 end=" ",
@@ -667,7 +677,7 @@ def check_and_apply_zoom(
             )
 
             # Create New Grid
-            if len(new_b_grid_gpu) + len(fine_b_grid_gpu) < 15000:
+            if len(new_b_grid_gpu) + len(fine_b_grid_gpu) < 20000:
                 print(
                     "New Res:",
                     new_res,
@@ -687,7 +697,7 @@ def check_and_apply_zoom(
 
                 new_posterior_gpu_1 = cp.full(
                     new_b_grid_gpu_1.shape,
-                    (1 / 2 / B_unk_bound),
+                    (1 / 2 / B_unk_bound_longitudinal),
                     dtype=new_posterior_gpu.dtype,
                 )  # type: ignore
                 old_indices = cp.searchsorted(new_b_grid_gpu_1, new_b_grid_gpu)
@@ -696,7 +706,7 @@ def check_and_apply_zoom(
                 normalization = cp.trapz(new_posterior_gpu_1, new_b_grid_gpu_1)
                 new_posterior_gpu = new_posterior_gpu_1
                 new_b_grid_gpu = new_b_grid_gpu_1
-                new_posterior_gpu /= normalization
+                new_posterior_gpu = new_posterior_gpu / normalization
                 del (
                     new_posterior_gpu_1,
                     fine_b_grid_gpu,
@@ -710,7 +720,7 @@ def check_and_apply_zoom(
                 pdf_mass[:-1] = new_posterior_gpu[:-1] * dB
                 pdf_mass[-1] = new_posterior_gpu[-1] * dB[-1]
                 cdf = cp.cumsum(pdf_mass)
-                cdf /= cdf[-1]  # Ensure it ends exactly at 1.0
+                cdf = cdf/cdf[-1]  # Ensure it ends exactly at 1.0
 
                 # Finding region where majority of the probability is concentrated
                 for i in range(5, 10):
@@ -734,9 +744,8 @@ def check_and_apply_zoom(
                     print("new_res:", cp.min(new_res))
                     raise ValueError("Resolution is less than zero")
                 # debugging =- explicitly check the break conditions FIXME
+                zoom_index += 1
 
-                if not (len(new_b_grid_gpu) >= 15000):
-                    break
             else:
                 new_res = initial_resolution
                 new_b_grid_gpu = cp.arange(
@@ -751,7 +760,7 @@ def check_and_apply_zoom(
                 # new_posterior_gpu_1 = cp.interp(new_b_grid_gpu_1, new_b_grid_gpu, new_posterior_gpu)
                 new_posterior_gpu = cp.full(
                     new_b_grid_gpu.shape,
-                    (1 / 2 / B_unk_bound),
+                    (1 / 2 / B_unk_bound_longitudinal),
                     dtype=new_posterior_gpu.dtype,
                 )
 
@@ -765,7 +774,7 @@ def check_and_apply_zoom(
                 pdf_mass[:-1] = new_posterior_gpu[:-1] * dB
                 pdf_mass[-1] = new_posterior_gpu[-1] * dB[-1]
                 cdf = cp.cumsum(pdf_mass)
-                cdf /= cdf[-1]  # Ensure it ends exactly at 1.0
+                cdf = cdf/cdf[-1]  # Ensure it ends exactly at 1.0
 
                 if cp.min(dB) <= 0:
                     print(cp.min(dB))
@@ -792,9 +801,7 @@ def check_and_apply_zoom(
                 if new_res <= 0:
                     print("new_res:", cp.min(new_res))
                     raise ValueError("Resolution is less than zero")
-
-                if not (len(new_b_grid_gpu) > 15000):
-                    break
+                zoom_index += 1
 
         print(
             f"  [ZOOM] Res: {current_res:.6f} -> {new_res:.6f} | Grid Size: {len(new_b_grid_gpu)}|",
@@ -830,13 +837,13 @@ def run_experiment_longitudinal_estimation(
     print("Starting Adaptive Experiment...")
     time_cursor = params.curr_time
 
-    t_sim, f_sim, by_sim, sim_spline = get_final_interpolator(config)
-    t_exp, f_bias_axis, exp_matrix = load_experiment(config)
-    f_bias_axis += params.f_bias_offset_nuisance
+    t_sim, f_sim, by_sim, sim_spline = get_final_interpolator(config, params)
+    t_exp, f_bias_axis, exp_matrix = load_experiment(config, config.Aligned)
+    f_bias_axis = f_bias_axis + params.f_bias_offset_nuisance
 
-    b_grid_gpu = cp.arange(-params.B_unk_bound, params.B_unk_bound, params.init_resolution)  # type: ignore
+    b_grid_gpu = cp.arange(-params.B_unk_bound_longitudinal, params.B_unk_bound_longitudinal, params.init_resolution)  # type: ignore
     curr_res = params.init_resolution
-    pdf_val = 1.0 / (2 * params.B_unk_bound)
+    pdf_val = 1.0 / (2 * params.B_unk_bound_longitudinal)
     posterior_gpu = cp.full_like(b_grid_gpu, pdf_val)
 
     curr_bias = 0.0
@@ -884,12 +891,15 @@ def run_experiment_longitudinal_estimation(
             fixed_by_estimate,
             b_grid_gpu,
             sim_spline,
-            sigma=params.sigma_noise,
+            sigma=params.sigma_noise_longitudinal,
         )
 
-        posterior_gpu *= likelihood
-        norm = cp.trapz(posterior_gpu, x=b_grid_gpu)
-        posterior_gpu /= norm
+        posterior_gpu_1 = cp.log(posterior_gpu) + cp.log(likelihood+1e-15)
+        posterior_gpu_1 = posterior_gpu_1 - cp.max(posterior_gpu_1)
+        posterior_gpu = cp.exp(posterior_gpu_1)
+        norm = cp.trapz(posterior_gpu, x = b_grid_gpu)
+        posterior_gpu = posterior_gpu / norm
+
 
         if params.print_plot:
             plt.plot(b_grid_gpu.get(), posterior_gpu.get())
@@ -903,7 +913,7 @@ def run_experiment_longitudinal_estimation(
             zoom_trigger_multiple=params.zoom_trigger_multiple,
             zoom_trigger_ratio=params.zoom_trigger_ratio,
             initial_resolution=params.init_resolution,
-            B_unk_bound=params.B_unk_bound,
+            B_unk_bound_longitudinal=params.B_unk_bound_longitudinal,
         )
 
         mode, stddev = calculate_summary_stats(posterior_gpu, b_grid_gpu)
@@ -918,7 +928,7 @@ def run_experiment_longitudinal_estimation(
 
         print(
             "\n",
-            f"T={t_next:.1f}s | Bias={curr_bias:.3f} | Est={mode:.5f} | Res={curr_res:.1e}",
+            f"T={t_next:.1f}s | Bias={curr_bias:.3f} | Est={mode:.5f} | StdDev={stddev:.1e} | Res={curr_res:.1e}",
             end=" ",
         )
 
@@ -953,10 +963,10 @@ def run_experiment_longitudinal_estimation(
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     np.savez_compressed(
-        f"{config.save_path}/longitudinal_estimation_results_{ts}.npz",
+        f"{config.save_path}/longitudinal_estimation_results_{params.Test}_{ts}.npz",
         **history_longitudinal_estimation,
     )
-    print("Results for Test saved successfully.", end=" ")
+    print(f"Results for Test longitudinal_estimation_results_{params.Test}_{ts} saved successfully.", end=" ")
 
     print("\n", f"Done in {time.time() - start_wall:.2f}s")
     return history
@@ -969,7 +979,7 @@ def check_and_apply_zoom_by(
     zoom_factor=1.5,
     zoom_trigger_multiple=400,
     zoom_trigger_ratio=0.2,
-    b_y_bounds=(-1.0, 1.0),
+    b_y_bounds=(DEFAULT_PARAMS.B_unk_bound_transverse_lower, DEFAULT_PARAMS.B_unk_bound_transverse_upper),
     initial_resolution=0.00025,
 ):
     to = time.time()
@@ -979,9 +989,9 @@ def check_and_apply_zoom_by(
     pdf_mass[:-1] = posterior_gpu[:-1] * dB
     pdf_mass[-1] = posterior_gpu[-1] * dB[-1]
     cdf = cp.cumsum(pdf_mass)
-    cdf /= cdf[-1]  # Ensure it ends exactly at 1.0
+    cdf = cdf/cdf[-1]  # Ensure it ends exactly at 1.0
 
-    for i in range(10, 15):
+    for i in range(5, 10):
         a = 10 ** (-i)
         idx_01 = int(cp.searchsorted(cdf, cp.array(a)))
         idx_99 = int(cp.searchsorted(cdf, cp.array(1 - a)))
@@ -1002,8 +1012,8 @@ def check_and_apply_zoom_by(
     # Check Trigger
     # if idx_99 - idx_01 < (ZOOM_TRIGGER_RATIO * total_points):
     new_res = current_res
-    new_b_grid_gpu = b_grid_gpu
-    new_posterior_gpu = posterior_gpu
+    new_b_grid_gpu = cp.copy(b_grid_gpu)
+    new_posterior_gpu = cp.copy(posterior_gpu)
     del b_grid_gpu, posterior_gpu
     cp.get_default_memory_pool().free_all_blocks()
 
@@ -1013,16 +1023,17 @@ def check_and_apply_zoom_by(
             > (new_b_grid_gpu[idx_99] - new_b_grid_gpu[idx_01])
         )
         or width_idx < 100
-        or len(new_b_grid_gpu) >= 15000
+        or len(new_b_grid_gpu) >= 20000
     ):
+        zoom_index = 0
         while (
             (
                 (new_res * zoom_trigger_multiple)
                 > (new_b_grid_gpu[idx_99] - new_b_grid_gpu[idx_01])
             )
             or width_idx < 100
-            or len(new_b_grid_gpu) >= 15000
-        ):
+            or len(new_b_grid_gpu) >= 20000
+        ) and zoom_index < 5:
             print(
                 f"  [ZOOM] Triggered! Mass concentrated in {width_idx} points.|",
                 end=" ",
@@ -1031,7 +1042,7 @@ def check_and_apply_zoom_by(
             fine_b_grid_gpu = cp.arange(
                 new_b_grid_gpu[idx_01], new_b_grid_gpu[idx_99], new_res
             )
-            if len(new_b_grid_gpu) + len(fine_b_grid_gpu) < 15000:
+            if len(new_b_grid_gpu) + len(fine_b_grid_gpu) < 20000:
                 new_b_grid_gpu_1 = cp.unique(
                     cp.concatenate((new_b_grid_gpu, fine_b_grid_gpu))
                 )
@@ -1049,7 +1060,7 @@ def check_and_apply_zoom_by(
                 normalization = cp.trapz(new_posterior_gpu_1, new_b_grid_gpu_1)
                 new_posterior_gpu = new_posterior_gpu_1
                 new_b_grid_gpu = new_b_grid_gpu_1
-                new_posterior_gpu /= normalization
+                new_posterior_gpu = new_posterior_gpu / normalization
                 del (
                     new_posterior_gpu_1,
                     fine_b_grid_gpu,
@@ -1063,9 +1074,9 @@ def check_and_apply_zoom_by(
                 pdf_mass[:-1] = new_posterior_gpu[:-1] * dB
                 pdf_mass[-1] = new_posterior_gpu[-1] * dB[-1]
                 cdf = cp.cumsum(pdf_mass)
-                cdf /= cdf[-1]  # Ensure it ends exactly at 1.0
+                cdf = cdf[-1]  # Ensure it ends exactly at 1.0
 
-                for i in range(10, 15):
+                for i in range(5, 10):
                     a = 10 ** (-i)
                     idx_01 = int(cp.searchsorted(cdf, cp.array(a)))
                     idx_99 = int(cp.searchsorted(cdf, cp.array(1 - a)))
@@ -1084,10 +1095,7 @@ def check_and_apply_zoom_by(
                 if new_res <= 0:
                     print("new_res:", cp.min(new_res))
                     raise ValueError("Resolution is less than zero")
-                # debugging =- explicitly check the break conditions FIXME
-
-                if not (len(new_b_grid_gpu) >= 15000):
-                    break
+                zoom_index+=1
             else:
                 new_res = initial_resolution
                 new_b_grid_gpu = cp.arange(b_y_bounds[0], b_y_bounds[1], new_res)  # type: ignore
@@ -1113,9 +1121,9 @@ def check_and_apply_zoom_by(
                 pdf_mass[:-1] = new_posterior_gpu[:-1] * dB
                 pdf_mass[-1] = new_posterior_gpu[-1] * dB[-1]
                 cdf = cp.cumsum(pdf_mass)
-                cdf /= cdf[-1]  # Ensure it ends exactly at 1.0
+                cdf = cdf/cdf[-1]  # Ensure it ends exactly at 1.0
 
-                for i in range(10, 15):
+                for i in range(5, 10):
                     a = 10 ** (-i)
                     idx_01 = int(cp.searchsorted(cdf, cp.array(a)))
                     idx_99 = int(cp.searchsorted(cdf, cp.array(1 - a)))
@@ -1133,9 +1141,7 @@ def check_and_apply_zoom_by(
                 if new_res <= 0:
                     print("new_res:", cp.min(new_res))
                     raise ValueError("Resolution is less than zero")
-
-                if not (len(new_b_grid_gpu) > 15000):
-                    break
+                zoom_index+=1
 
         print(
             f"  [ZOOM] Res: {current_res} -> {new_res} | Grid Size: {len(new_b_grid_gpu)}|",
@@ -1156,10 +1162,10 @@ def run_experiment_y_estimation(
     print("...Starting Adaptive Experiment for Y Estimation...")
     time_cursor = params.curr_time
 
-    t_exp, f_bias_axis, exp_matrix = load_experiment(config)
-    t_sim, f_sim, by_sim, sim_interp = get_final_interpolator(config)
+    t_exp, f_bias_axis, exp_matrix = load_experiment(config, config.Aligned)
+    t_sim, f_sim, by_sim, sim_interp = get_final_interpolator(config, params)
 
-    b_grid_gpu = cp.arange(-params.B_unk_bound, params.B_unk_bound, params.init_resolution)  # type: ignore
+    b_grid_gpu = cp.arange(params.B_unk_bound_transverse_lower, params.B_unk_bound_transverse_upper, params.init_resolution)  # type: ignore
     curr_res = params.init_resolution
 
     posterior_gpu = cp.ones_like(b_grid_gpu)
@@ -1208,7 +1214,7 @@ def run_experiment_y_estimation(
             curr_bias_z,
             by_grid_cpu,
             sim_interp,
-            sigma=params.sigma_noise,
+            sigma=params.sigma_noise_transverse,
             fixed_bz_estimate=fixed_bz_estimate,
         )
 
@@ -1216,7 +1222,9 @@ def run_experiment_y_estimation(
             plt.plot(b_grid_gpu.get(), posterior_gpu.get())  # type: ignore
             plt.show()
 
-        posterior_gpu *= likelihood
+        posterior_gpu = cp.log(posterior_gpu) + cp.log(likelihood)
+        posterior_gpu = posterior_gpu - cp.max(posterior_gpu)
+        posterior_gpu = cp.exp(posterior_gpu)
         norm = cp.trapz(posterior_gpu, b_grid_gpu)
         posterior_gpu /= norm
 
@@ -1227,7 +1235,7 @@ def run_experiment_y_estimation(
             zoom_factor=params.zoom_factor,
             zoom_trigger_multiple=params.zoom_trigger_multiple,
             zoom_trigger_ratio=params.zoom_trigger_ratio,
-            b_y_bounds=(-params.B_unk_bound, params.B_unk_bound),
+            b_y_bounds=(params.B_unk_bound_transverse_lower, params.B_unk_bound_transverse_upper),
             initial_resolution=params.init_resolution,
         )
 
@@ -1242,7 +1250,7 @@ def run_experiment_y_estimation(
         history["bgrids"].append(b_grid_gpu.get())
 
         print(
-            f"T={t_next:.1f} | BiasZ={curr_bias_z:.3f} | Est By={mode:.5f} | Std={stddev:.4f}"
+            f"T={t_next:.1f} | BiasZ={curr_bias_z:.3f} | Est By={mode:.5f} | Std={stddev:.4f}| Res={curr_res:.1e}",
         )
 
         t_fut_1 = np.float64(t_next)
@@ -1268,10 +1276,10 @@ def run_experiment_y_estimation(
     }
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     np.savez_compressed(
-        f"{config.save_path}/transverse_field_estimation_results_{ts}.npz",
+        f"{config.save_path}/transverse_field_estimation_results_{params.Test}_{ts}.npz",
         **history_y_estimation,
     )
-    print(f"Results for Transverse Field, Test saved successfully.", end=" ")
+    print(f"Results for Transverse Field, Test_{params.Test}_{ts} saved successfully.", end=" ")
 
     print("\n", f"Done in {time.time() - start_wall:.2f}s")
     return history
@@ -1292,6 +1300,7 @@ def altopt(
     Est_First_Z = params.Est_First_Z
     fixed_bz_estimate = params.fixed_bz_estimate
     fixed_by_estimate = params.fixed_by_estimate
+    Test = params.Test
     if Est_First_Z:
         bz_history = []
         by_history = [fixed_by_estimate]
@@ -1470,8 +1479,8 @@ def plot_altopt(config, bz_history, by_history, trajectory_mode=True):
 
 def test_altopt_sweep(
     config, 
-    t_step_values=[0.2, 0.5, 1.0],
-    fixed_by_init_values=[0.0, -0.05, -0.10, -0.12],
+    t_step_values=[0.1, 0.2, 0.5, 1.0],
+    fixed_by_init_values=[0.0, 0.05, 0.10, 0.12],
     max_time=30,
     num_iter=3,
     tol_bz=1e-4,

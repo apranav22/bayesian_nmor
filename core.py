@@ -898,7 +898,7 @@ def run_experiment_longitudinal_estimation(
             fixed_by_estimate,
             b_grid_gpu,
             sim_spline,
-            sigma=params.sigma_noise_longitudinal,
+            sigma_noise=params.sigma_noise_longitudinal,
         )
 
         posterior_gpu_1 = cp.log(posterior_gpu) + cp.log(likelihood+1e-15)
@@ -1221,7 +1221,7 @@ def run_experiment_y_estimation(
             curr_bias_z,
             by_grid_cpu,
             sim_interp,
-            sigma=params.sigma_noise_transverse,
+            sigma_noise=params.sigma_noise_transverse,
             fixed_bz_estimate=fixed_bz_estimate,
         )
 

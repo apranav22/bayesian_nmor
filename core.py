@@ -5,8 +5,11 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import cupy as cp
 import time
+import json
+import sys
+import platform
 from datetime import datetime
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, replace, asdict
 from typing import Any, Mapping, Optional
 from scipy.interpolate import RegularGridInterpolator
 from matplotlib.ticker import MaxNLocator
@@ -39,7 +42,7 @@ class DataContext:
     exp_data: str
     save_path: str
     interpolator: Optional[str]
-
+    Aligned: bool = True # for dataset 1, set it to false
     def __post_init__(self):
         """Generate timestamped save directory and create it."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -73,6 +76,7 @@ class ParameterContext:
     - fixed_bz_estimate / fixed_by_estimate: initial seeds
     """
 
+    # preprocessing parameters
     # Common experiment parameters
     curr_time: float = 5.0
     print_plot: bool = False
@@ -127,6 +131,57 @@ class ParameterContext:
             problems.append("patience must be >= 1")
         return (len(problems) == 0, problems)
 
+
+# data logging
+def save_run_metadata(
+    config: DataContext,
+    params: ParameterContext,
+    *,
+    run_type: str,
+    extras: Optional[Mapping[str, Any]] = None,
+) -> str:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    meta = {
+        "run_type": run_type,
+        "timestamp": ts,
+        "config": asdict(config),
+        "params": asdict(params),
+        "env": {
+            "python": sys.version,
+            "platform": platform.platform(),
+            "packages": {
+                "numpy": np.__version__,
+                "pandas": pd.__version__,
+                "cupy": getattr(cp, "__version__", "n/a"),
+                "scipy": getattr(__import__("scipy"), "__version__", "n/a"),
+            },
+        },
+        "extras": dict(extras) if extras else {},
+    }
+    try:
+        devcount = cp.cuda.runtime.getDeviceCount()
+        devices = []
+        for d in range(devcount):
+            p = cp.cuda.runtime.getDeviceProperties(d)
+            name = p.get("name")
+            if isinstance(name, bytes):
+                name = name.decode(errors="ignore")
+            devices.append({
+                "id": d,
+                "name": name,
+                "totalGlobalMem": int(p.get("totalGlobalMem", 0)),
+                "multiProcessorCount": int(p.get("multiProcessorCount", 0)),
+                "major": int(p.get("major", 0)),
+                "minor": int(p.get("minor", 0)),
+            })
+        meta["env"]["cuda"] = {"device_count": devcount, "devices": devices}
+    except Exception:
+        pass
+
+    out = os.path.join(config.save_path, f"run_manifest_{run_type}_{ts}.json")
+    with open(out, "w", encoding="utf-8") as fh:
+        json.dump(meta, fh, indent=2)
+    return out
 
 # default object: 
 DATA_DIR = r"DataFiles_to_Dinesh_Pranav\Data_files\Simulation\Dataset_3"
@@ -192,7 +247,7 @@ def load_simulation_cube(config: DataContext):
     return t_axis_0, f_axis, by_axis, cube
 
 
-def load_experiment(config: DataContext, Aligned=False):
+def load_experiment(config: DataContext):
     to = time.time()
     print(f"Loading Experiment from {config.exp_data}...")
     t = pd.read_csv(config.exp_time, header=None).values.flatten()
@@ -202,7 +257,7 @@ def load_experiment(config: DataContext, Aligned=False):
     if raw_data.shape != (len(t), len(f_bias)):
         raw_data = raw_data.T
 
-    if not Aligned:
+    if not config.Aligned:
         scale = 1 / (np.max(raw_data) - np.min(raw_data))
         calibrated_data = (raw_data - np.min(raw_data)) * scale
         calibrated_data = np.clip(calibrated_data, 0.0, 1.0)
@@ -210,10 +265,10 @@ def load_experiment(config: DataContext, Aligned=False):
 
         t = t[__:] - t_exp_0
         raw_data = raw_data[__:,]
-    # calibrated_data= calibration(raw_data, np.min(raw_data), np.max(raw_data))
-    print(f"  > Exp Start: {t_exp_0:.4f}s")
-    print(time.time() - to, "was the time taken to load exp data.")
-    return t, f_bias, calibrated_data[__:,]
+        print(f"  > Exp Start: {to:.4f}s")
+        print(time.time() - to, "was the time taken to load exp data.")
+    calibrated_data= calibration(raw_data, np.min(raw_data), np.max(raw_data))
+    return t, f_bias, calibrated_data
 
 
 def calibration(data, v_dark, v_max):
@@ -291,7 +346,7 @@ def plot_slice(by_idx, file_path):
     # interpolator and interpolation validator for Y field estimation
 
 
-def get_final_interpolator(config: Optional[DataContext]):
+def get_final_interpolator(config: Optional[DataContext], method = "linear"):
     # if the config DataContext stringblob has an interpolator path, use that to load the interpolator otherwise generate.
     print("...Building Final Interpolator...")
     if not os.path.exists(config.interpolator):
@@ -300,7 +355,7 @@ def get_final_interpolator(config: Optional[DataContext]):
         full_interp = RegularGridInterpolator(
             (t_sim, f_sim, by_sim),
             cube,
-            method="linear",
+            method=method,
             bounds_error=False,
             fill_value=np.nan,
         )
@@ -1281,7 +1336,7 @@ def altopt(
     config: DataContext, 
     params: ParameterContext,
 ):
-    # ! load these arguments using some parameter context. 
+    wall_start = time.time()
     num_iter = params.num_iter
     max_time = params.max_time
     curr_time = params.curr_time
@@ -1292,6 +1347,24 @@ def altopt(
     Est_First_Z = params.Est_First_Z
     fixed_bz_estimate = params.fixed_bz_estimate
     fixed_by_estimate = params.fixed_by_estimate
+
+    # Manifest: start of alt-opt run
+    save_run_metadata(
+        config,
+        params,
+        run_type="altopt_start",
+        extras={
+            "Est_First_Z": Est_First_Z,
+            "fixed_bz_estimate": fixed_bz_estimate,
+            "fixed_by_estimate": fixed_by_estimate,
+            "t_step": t_step,
+            "max_time": max_time,
+            "num_iter": num_iter,
+            "tol_bz": tol_bz,
+            "tol_by": tol_by,
+            "patience": patience,
+        },
+    )
     if Est_First_Z:
         bz_history = []
         by_history = [fixed_by_estimate]
@@ -1355,6 +1428,26 @@ def altopt(
                     f"Early stopping at iteration {i + 1}: Bz and By stable for >= {patience} steps (tol_bz={tol_bz}, tol_by={tol_by})."
                 )
                 break
+
+        # Manifest: summary of alt-opt (Est_First_Z branch)
+        elapsed = time.time() - wall_start
+        converged = (stable_bz_runs >= patience) and (stable_by_runs >= patience)
+        save_run_metadata(
+            config,
+            params,
+            run_type="altopt_summary",
+            extras={
+                "branch": "Est_First_Z",
+                "converged": converged,
+                "stable_bz_runs": stable_bz_runs,
+                "stable_by_runs": stable_by_runs,
+                "final_bz": bz_history[-1] if bz_history else None,
+                "final_by": by_history[-1] if by_history else None,
+                "bz_history": bz_history,
+                "by_history": by_history,
+                "elapsed_seconds": elapsed,
+            },
+        )
 
         return bz_history, by_history
 
@@ -1420,6 +1513,26 @@ def altopt(
                     f"Early stopping at iteration {i + 1}: Bz and By stable for >= {patience} steps (tol_bz={tol_bz}, tol_by={tol_by})."
                 )
                 break
+
+        # Manifest: summary of alt-opt (By-first branch)
+        elapsed = time.time() - wall_start
+        converged = (stable_bz_runs >= patience) and (stable_by_runs >= patience)
+        save_run_metadata(
+            config,
+            params,
+            run_type="altopt_summary",
+            extras={
+                "branch": "By_First",
+                "converged": converged,
+                "stable_bz_runs": stable_bz_runs,
+                "stable_by_runs": stable_by_runs,
+                "final_bz": bz_history[-1] if bz_history else None,
+                "final_by": by_history[-1] if by_history else None,
+                "bz_history": bz_history,
+                "by_history": by_history,
+                "elapsed_seconds": elapsed,
+            },
+        )
 
         return bz_history, by_history
 

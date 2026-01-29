@@ -40,9 +40,11 @@ class DataContext:
     save_path: str
     interpolator: Optional[str]
     Aligned: bool = False
+
     # Pulse parameters
     sim_pulse_thresh: float = 0.25
     exp_pulse_thresh: float = 0.2
+
 
     def __post_init__(self):
         """Generate timestamped save directory and create it."""
@@ -95,6 +97,10 @@ class ParameterContext:
     Test: str = f"Starting with {curr_time} us_T Step {t_step} us"
 
     #FIXME: T_STEP and sigma_noise must be set such that the variable list of inputs are also accepted
+
+    # Pulse parameters
+    sim_pulse_thresh: float = 0.1
+    exp_pulse_thresh: float = 0.2
     
     # Adaptive experiment/grid
     kl_y_grid_size: int = 100
@@ -439,6 +445,7 @@ def calculate_likelihood_gpu(
     y_theory_gpu = cp.asarray(
         get_predictions_batch(sim_spline, t_sim_abs, f_total_query, y_grid)
     )
+    print(y_theory_gpu)
     y_meas_gpu = cp.asarray(y_meas)
     resid_sq = (y_meas_gpu[:, None] - y_theory_gpu) ** 2
     sse = cp.sum(resid_sq, axis=0)
@@ -621,7 +628,7 @@ def check_and_apply_zoom(
 
     # Finding region where majority of the probability is concentrated
     # i have added this for loop for debugging
-    for i in range(5, 10):
+    for i in range(10, 15):
         a = 10 ** (-i)
         idx_01 = int(cp.searchsorted(cdf, cp.array(a)))
         idx_99 = int(cp.searchsorted(cdf, cp.array(1 - a)))

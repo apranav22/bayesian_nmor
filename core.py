@@ -445,7 +445,6 @@ def calculate_likelihood_gpu(
     y_theory_gpu = cp.asarray(
         get_predictions_batch(sim_spline, t_sim_abs, f_total_query, y_grid)
     )
-    print(y_theory_gpu)
     y_meas_gpu = cp.asarray(y_meas)
     resid_sq = (y_meas_gpu[:, None] - y_theory_gpu) ** 2
     sse = cp.sum(resid_sq, axis=0)
@@ -1081,7 +1080,7 @@ def check_and_apply_zoom_by(
                 pdf_mass[:-1] = new_posterior_gpu[:-1] * dB
                 pdf_mass[-1] = new_posterior_gpu[-1] * dB[-1]
                 cdf = cp.cumsum(pdf_mass)
-                cdf = cdf[-1]  # Ensure it ends exactly at 1.0
+                cdf = cdf/cdf[-1]  # Ensure it ends exactly at 1.0
 
                 for i in range(5, 10):
                     a = 10 ** (-i)

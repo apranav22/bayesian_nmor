@@ -2,6 +2,7 @@
 Tests/
 Results/
 DataFiles_to_Dinesh_Pranav.zip
+DataFiles_to_Dinesh_Pranav/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

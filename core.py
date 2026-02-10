@@ -318,7 +318,7 @@ def get_final_interpolator(config: Optional[DataContext], params: ParameterConte
             cube,
             method="linear",
             bounds_error=False,
-            fill_value=np.nan,
+            fill_value=None, #FIXME: currently linearly extrapolates for outside of 0.5 bound
         )
         with open(
             config.interpolator, "wb"
@@ -452,7 +452,7 @@ def calculate_likelihood_gpu(
     del y_theory_gpu, y_meas_gpu, resid_sq
     cp.get_default_memory_pool().free_all_blocks()
     if cp.any(cp.isnan(log_L)):
-        print("NaNs detected in Likelihood!")
+        raise ValueError("NaNs detected in Likelihood!")
     print(time.time() - to, "was the time taken to compute the likelihood.|", end=" ")
     return cp.exp(log_L - cp.max(log_L))
 
@@ -540,6 +540,10 @@ def calculate_likelihood_by(
     resid_sq = (y_meas_gpu[:, None] - y_pred_gpu) ** 2
     sse = cp.sum(resid_sq, axis=0)
     log_L = -sse / (2 * sigma_noise**2)
+    
+    if np.any(np.isnan(y_pred_gpu)):
+        raise ValueError("NaNs detected in prediction!")
+    
     del y_pred_gpu, y_meas_gpu, resid_sq
     cp.get_default_memory_pool().free_all_blocks()
     return cp.exp(log_L - cp.max(log_L))

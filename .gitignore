@@ -1,6 +1,7 @@
 .ruff_cache/
 Tests/
 Results/
+venv/
 DataFiles_to_Dinesh_Pranav.zip
 DataFiles_to_Dinesh_Pranav/
 # Byte-compiled / optimized / DLL files

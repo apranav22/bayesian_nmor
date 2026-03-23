@@ -3,6 +3,7 @@ import numpy as np
 import pickle
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
 import cupy as cp
 from cupyx.scipy.ndimage import map_coordinates
 import time
@@ -14,7 +15,7 @@ from matplotlib.ticker import MaxNLocator
 
 # Data loading
 @dataclass
-class DataContext: 
+class DataContext:
     """Bundle of file strings that allow loading of the data we are interested in. 
     
     Stores paths to simulation and experiment data, interpolator cache, and handles
@@ -38,8 +39,8 @@ class DataContext:
     exp_time: str
     exp_freq_axis: str
     exp_data: str
-    save_path: str
     interpolator: Optional[str]
+    save_path: str = f"Results/Dataset_7/Test_{datetime.now().date().strftime('%d_%m_%Y')}"
     Aligned: bool = False
 
     # Pulse parameters
@@ -47,11 +48,15 @@ class DataContext:
     exp_pulse_thresh: float = 0.3
 
 
-    def __post_init__(self):
-        """Generate timestamped save directory and create it."""
-        timestamp = datetime.now().date().strftime("%Y_%m_%d")
-        object.__setattr__(self, 'save_path', os.path.join(self.save_path, f'Test_{timestamp}'))
-        os.makedirs(self.save_path, exist_ok=True)
+    def __setattr__(self, prop, val):
+        if prop == 'save_path' and val is not None:
+            if 'save_path' in self.__dict__ and self.__dict__['save_path'] is not None:
+                current_path = getattr(self, 'save_path', None)
+                val_norm = os.path.normpath(str(val))
+                if current_path is not None and os.path.basename(current_path) != val_norm:
+                    val = os.path.join(current_path, str(val))
+            os.makedirs(val, exist_ok=True)
+        super().__setattr__(prop, val)
 
 
 @dataclass
@@ -81,12 +86,13 @@ class ParameterContext:
     """
 
     # Common experiment parameters
+    Test: str = ""
     curr_time: float = 5.0
     print_plot: bool = False
     zoom_factor: float = 1.1
     zoom_trigger_multiple: int = 400
     zoom_trigger_ratio: float = 0.2
-    max_time: float = 30.0
+    max_time: float = 70.0
     t_step: float = 0.2
     B_unk_bound_longitudinal: float = 1.0
     B_unk_bound_transverse_lower: float = 0.0
@@ -96,9 +102,7 @@ class ParameterContext:
     sigma_noise_longitudinal: float = 0.1
     sigma_noise_transverse: float = 0.1
     f_bias_offset_nuisance: float = 0.0
-    Test: str = f"Starting with {curr_time} us_T Step {t_step} us"
-
-    #FIXME: T_STEP and sigma_noise must be set such that the variable list of inputs are also accepted
+    Est_First_Z: bool = False
 
     # Pulse parameters
     sim_pulse_thresh: float = 0.3
@@ -113,14 +117,20 @@ class ParameterContext:
     tol_by: float = 1e-8
     patience: int = 2
 
-    Est_First_Z: bool = False
     fixed_bz_estimate: float = 0.0
     fixed_by_estimate: float = 0.0
+
+
+    def __post_init__(self):
+        if self.Est_First_Z:
+            self.Test = f"Starting_with_{self.curr_time}_us_T_Step_{self.t_step}_us_with_initial_estimate_By_{self.fixed_by_estimate}"
+        else:
+            self.Test = f"Starting_with_{self.curr_time}_us_T_Step_{self.t_step}_us_with_initial_estimate_Bz_{self.fixed_bz_estimate}"
 
     def validate(self) -> tuple[bool, list[str]]:
         """Basic parameter sanity checks.
 
-        Returns (ok, problems). Problems contains human-readable strings.
+        Returns (ok, problems).
         """
         problems: list[str] = []
         if self.zoom_factor <= 1.0:
@@ -298,8 +308,7 @@ DATASET3 = DataContext(
     exp_time = r"DataFiles_to_Dinesh_Pranav\Data_files\Experiment\t_exp.csv",
     exp_freq_axis = r"DataFiles_to_Dinesh_Pranav\Data_files\Experiment\Y_MHz_Exp.csv",
     exp_data = r"DataFiles_to_Dinesh_Pranav\Data_files\Experiment\Probe_trans_Exp.csv",
-    save_path = r"Results\Dataset_7",
-    interpolator=r"DataFiles_to_Dinesh_Pranav\Data_files\Simulation\Dataset_7\gpu_sim_interpolator.npz",
+    interpolator=r"DataFiles_to_Dinesh_Pranav\Data_files\Simulation\Dataset_7\gpu_sim_interpolator_new_normalisation_linear_0.3_threshold.npz",
     Aligned = False
 )
 
@@ -373,13 +382,13 @@ def load_experiment(config: DataContext, Aligned=DATASET3.Aligned):
         raw_data = raw_data[__:,]
         print(f"  > Exp Start: {t_exp_0:.4f}s")
     
-    '''#this is for the new dataset frmo 13/02 only FIXME
+    #this is for the new dataset frmo 13/02 only FIXME
     t = t * 1e6
     t_index = np.where(np.asarray(t)>70)[0][0]
     f_index_1 = np.where(np.asarray(f_bias)<-1.5)[0][0]
     f_index_2 = np.where(np.asarray(f_bias)>1.5)[0][0]
     t = t[:t_index]
-    raw_data = raw_data[:t_index,:]'''
+    raw_data = raw_data[:t_index,:]
     calibrated_data= calibration(raw_data, np.min(raw_data), np.max(raw_data))
    
     print(time.time() - to, "was the time taken to load exp data.")
@@ -397,12 +406,12 @@ def plot_heat_and_surface(
     Y_vec,
     Z_arr,
     title_prefix="Data",
-    estimation_mode="longitudinal",
     trajectory_mode=False,
     traj_bias=[],
     curr_time=5.0,
+    save_path = ''
 ):
-    Yg = Yg * 0.7 #FIXME Mhz to Gauss conversion for plotting
+    Y_vec = Y_vec / 0.7 #FIXME Mhz to Gauss conversion for plotting
     Xg, Yg = np.meshgrid(X_vec, Y_vec, indexing="ij")  # note: meshgrid order (cols = y)
     # heatmap
     plt.figure(figsize=(8, 5))
@@ -414,7 +423,7 @@ def plot_heat_and_surface(
         traj_bias = np.repeat(
             traj_bias, (X_vec.shape[0] - curr_time_index - 1) // len(traj_bias)
         )
-        traj_bias = np.asarray(traj_bias)*0.7 #FIXME Mhz to Gauss conversion for plotting
+        traj_bias = np.asarray(traj_bias)/0.7 #FIXME Mhz to Gauss conversion for plotting
         plt.plot(
             X_vec[curr_time_index] + X_vec[: len(traj_bias)],
             traj_bias,
@@ -426,7 +435,9 @@ def plot_heat_and_surface(
     plt.colorbar(label="Probe Transmitted Intensity")
     plt.title(f"{title_prefix} heatmap (rows=time, cols=freq)")
     plt.tight_layout()
-    plt.show()
+    if save_path != "": 
+        plt.savefig(save_path)
+    if save_path == "": plt.show()
     # 3D surface (might be heavy)
     fig = plt.figure(figsize=(9, 6))
     ax = fig.add_subplot(111, projection="3d")
@@ -436,7 +447,7 @@ def plot_heat_and_surface(
     ax.set_zlabel("Probe Transmitted Intensity")
     plt.title(f"{title_prefix} 3D surface")
     plt.tight_layout()
-    plt.show()
+    if save_path == "": plt.show()
 
 
 def plot_slice(by_idx, file_path):
@@ -456,6 +467,79 @@ def plot_slice(by_idx, file_path):
     plt.xlabel("Time")
     plt.ylabel("Frequency")
     plt.show()
+
+def animation_posterior(posteriors, bgrid, save_path):
+    # Setup figure
+    fig, ax = plt.subplots(figsize=(8, 6))
+    line, = ax.plot([], [], lw=2)
+    ax.set_xlabel("Magnetic Field B")
+    ax.set_ylabel("Posterior Probability")
+    ax.grid(True)
+
+    # Initialization function
+    def init():
+        line.set_data([], [])
+        return line,
+
+    # Animation update function
+    def update(frame):
+        # Assuming bgrid and posteriors are lists/arrays of length 90
+        x = bgrid[frame]/0.7 #Conversion from Mhz to Gauss
+        y = posteriors[frame]
+        
+        # Update data
+        line.set_data(x, y)
+        
+        # Rescale axes dynamically to fit the new zoomed/peaked distribution
+        ax.set_xlim(x.min(), x.max())
+        ax.set_ylim(0, y.max() * 1.1)
+        ax.set_xlabel("Field (Gauss)"); ax.set_ylabel("Probability Density")
+        ax.set_title(f"Posterior Step {frame}")
+        return line,
+
+    # Create animation (interval in milliseconds)
+    anim = FuncAnimation(fig, update, frames=len(posteriors), 
+                        init_func=init, blit=False, interval=100)
+
+    # Option 2: Save as GIF (No external dependencies usually)
+    anim.save(save_path, writer='pillow', fps=4)
+
+def animation_kl(expectedkl, f_bias_axis, save_path):
+    # Setup figure
+    fig, ax = plt.subplots(figsize=(8, 6))
+    line, = ax.plot([], [], lw=2)
+    ax.set_xlabel("Bias Field")
+    ax.set_ylabel("Expected KL Divergence")
+    ax.grid(True)
+
+    # Initialization function
+    def init():
+        line.set_data([], [])
+        return line,
+
+    # Animation update function
+    def update(frame):
+        # Assuming bgrid and posteriors are lists/arrays of length 90
+        x = f_bias_axis
+        y = expectedkl[frame]
+        
+        # Update data
+        line.set_data(x, y)
+        
+        # Rescale axes dynamically to fit the new zoomed/peaked distribution
+        ax.set_xlim(x.min(), x.max())
+        ax.set_ylim(0, y.max() * 1.1)
+        ax.set_xlabel("Longitudinal Bias Field (Gauss)")
+        ax.set_title(f"Expected_KL {frame}")
+        return line,
+
+    # Create animation (interval in milliseconds)
+    anim = FuncAnimation(fig, update, frames=len(expectedkl), 
+                        init_func=init, blit=False, interval=100)
+
+    # Option 2: Save as GIF (No external dependencies usually)
+    anim.save(save_path, writer='pillow', fps=4)
+
 
     # interpolator and interpolation validator for Y field estimation
 
@@ -536,6 +620,7 @@ def get_predictions_batch(interpolator, t_pts, z_vals, y_grid):
         return predictions.reshape(final_shape[1:])
 
 # Likelihood and KL for Longtudinal Estimation
+#FIXME introduce Z score standardisation
 def calculate_likelihood_gpu(
     y_meas, t_sim_abs, curr_bias, candidate_biases, y_grid, b_grid_gpu, sim_spline, sigma_noise = DEFAULT_PARAMS.sigma_noise_longitudinal
 ):
@@ -623,6 +708,7 @@ def calculate_kl_divergence_gpu(
 
 
 # KL and Likelihood for Y field Estimation
+#FIXME introduce Z score standardisation
 def calculate_likelihood_by(
     y_meas,
     t_chunk_sim,
@@ -972,6 +1058,7 @@ def run_experiment_longitudinal_estimation(
     posterior_gpu = cp.full_like(b_grid_gpu, pdf_val)
 
     curr_bias = 0.0
+    start_time = params.curr_time
 
     history = {
         "time": [],
@@ -1066,7 +1153,9 @@ def run_experiment_longitudinal_estimation(
 
         f_index_1 = cp.where(f_bias_axis > f_sim[10])[0][0]
         f_index_2 = cp.where(f_bias_axis > f_sim[-10])[0][0]
-        next_bias, expectedkl = calculate_kl_divergence_gpu(
+        
+        #FIXME for random selection protocol tempolrarily disabling this
+        '''next_bias, expectedkl = calculate_kl_divergence_gpu(
             posterior_gpu,
             b_grid_gpu,
             fixed_by_estimate,
@@ -1077,10 +1166,14 @@ def run_experiment_longitudinal_estimation(
             y_grid_size=params.kl_y_grid_size,
             sigma_noise=params.sigma_noise_longitudinal,
             batch_size=131,
-        )
+        )'''
 
-        history["expectedkl"].append(expectedkl.get())
-        curr_bias = min(max(next_bias, -1.5), 1.5)
+        random_bias = cp.random.choice(f_bias_axis[f_index_1:f_index_2], size=1, replace=False)
+
+        # history["expectedkl"].append(expectedkl.get()) FIXME
+        # curr_bias = min(max(next_bias, -1.5), 1.5)
+        #FIXME random field estimation protocol
+        curr_bias = random_bias[0]
         time_cursor = t_next
 
     history_longitudinal_estimation = {
@@ -1094,12 +1187,32 @@ def run_experiment_longitudinal_estimation(
         "expectedkl": np.array(history["expectedkl"], dtype=object),
     }
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts = datetime.now().strftime("%d_%m_%Y__%H_%M_%S")
     np.savez_compressed(
         f"{config.save_path}/longitudinal_estimation_results_{params.Test}_{ts}.npz",
         **history_longitudinal_estimation,
     )
     print(f"Results for Test longitudinal_estimation_results_{params.Test}_{ts} saved successfully.", end=" ")
+
+    #Plotting
+
+    plot_heat_and_surface(t_exp.get(), f_bias_axis.get(), exp_matrix.get(), trajectory_mode=True, traj_bias = np.array(history["bias"]), curr_time = start_time, title_prefix="Bias Trajectory", save_path = os.path.join(config.save_path ,f"Bias_Trajectory_Longitudinal_Test_{params.Test}_{ts}.png"))
+    animation_posterior(np.array(history["posteriors"], dtype=object), np.array(history["bgrids"], dtype=object), os.path.join(config.save_path , f"Longitudinal_Test_{params.Test}_{ts}_Posterior.gif"))
+    # animation_kl(np.array(history["expectedkl"], dtype=object), f_bias_axis[f_index_1:f_index_2].get(), save_path = os.path.join(config.save_path , f"Longitudinal_Test_{params.Test}_{ts}_KL.gif"))
+
+    # save_path_mode = os.path.join(config.save_path, f'Longitudinal_Mode_Convergence_MAP_Test_{params.Test}_{ts}.png')
+    # plt.plot(np.array(history["time"]), np.array(history["est"])/0.7, label=f"Mode Convergence", marker = '.')
+    # plt.xlabel("Time (microseconds)")
+    # plt.ylabel("Mode - Longitudinal Field Estimate (Gauss)")
+    # plt.title("Mode Convergence over experiments - Bayesian")
+    # plt.savefig(save_path_mode)
+
+    # save_path_std = os.path.join(config.save_path, f'Longitudinal_Std_Convergence_MAP_Test_{params.Test}_{ts}.png')
+    # plt.plot(np.array(history["time"]), np.array(history["stddev"])/0.7, label=f"Standard Deviation Convergence", marker = '.')
+    # plt.xlabel("Time (microseconds)")
+    # plt.ylabel("Standard Deviation (Gauss)")
+    # plt.title("Standard Deviation Convergence over experiments - Bayesian")
+    # plt.savefig(save_path_std)
 
     print("\n", f"Done in {time.time() - start_wall:.2f}s")
     return history
@@ -1317,6 +1430,7 @@ def run_experiment_y_estimation(
     posterior_gpu /= cp.sum(posterior_gpu) * curr_res
 
     curr_bias_z = 0.0
+    start_time = params.curr_time
 
     history = {
         "time": [],
@@ -1397,7 +1511,7 @@ def run_experiment_y_estimation(
         history['bgrids'].append(b_grid_gpu.get())
 
         print("\n",
-            f"T={t_next:.1f} | BiasZ={curr_bias_z:.3f} | Est By={mode:.5f} | Std={stddev:.4f}| Res={curr_res:.1e}", end = ""
+            f"T={t_next:.1f} | BiasZ={curr_bias_z:.3f} | Est By={mode:.5f} | Std={stddev:.4f}| Res={curr_res:.1e}", end = " "
         )
 
         t_fut_1 = np.float64(t_next)
@@ -1405,12 +1519,17 @@ def run_experiment_y_estimation(
 
         f_index_1 = cp.where(f_bias_axis > f_sim[10])[0][0]
         f_index_2 = cp.where(f_bias_axis > f_sim[-10])[0][0]
-        next_bias, expectedkl = calculate_kl_by(
-            posterior_gpu, b_grid_gpu, sim_interp, t_fut_1, t_fut_2, f_bias_axis[f_index_1:f_index_2], fixed_bz_estimate=fixed_bz_estimate, sigma_noise=params.sigma_noise_transverse, batch_size=131, y_grid_size=params.kl_y_grid_size
-        )
 
-        history["expectedkl"].append(expectedkl.get())
-        curr_bias_z = min(max(next_bias, -1.5), 1.5)
+        #FIXME for random selection protocol tempolrarily disabling this
+        '''next_bias, expectedkl = calculate_kl_by(
+            posterior_gpu, b_grid_gpu, sim_interp, t_fut_1, t_fut_2, f_bias_axis[f_index_1:f_index_2], fixed_bz_estimate=fixed_bz_estimate, sigma_noise=params.sigma_noise_transverse, batch_size=131, y_grid_size=params.kl_y_grid_size
+        )'''
+
+        random_bias = cp.random.choice(f_bias_axis[f_index_1:f_index_2], size=1, replace=False)
+        # history["expectedkl"].append(expectedkl.get())
+        # curr_bias_z = min(max(next_bias, -1.5), 1.5)
+        # FIXME uniform field estimation protocol
+        curr_bias_z = random_bias[0]
         time_cursor = t_next
 
     history_y_estimation = {
@@ -1423,12 +1542,32 @@ def run_experiment_y_estimation(
         "bgrids": np.array(history["bgrids"], dtype=object),
         "expectedkl": np.array(history["expectedkl"], dtype=object),
     }
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts = datetime.now().strftime("%d_%m_%Y__%H_%M_%S")
     np.savez_compressed(
         f"{config.save_path}/transverse_field_estimation_results_{params.Test}_{ts}.npz",
         **history_y_estimation,
     )
     print(f"Results for Transverse Field, Test_{params.Test}_{ts} saved successfully.", end=" ")
+
+    #Plotting
+
+    plot_heat_and_surface(t_exp.get(), f_bias_axis.get(), exp_matrix.get(), trajectory_mode=True, traj_bias = np.array(history["bias"]), curr_time = params.curr_time, title_prefix="Bias Trajectory", save_path = os.path.join(config.save_path, f"Bias_Trajectory_Transverse_Test_{params.Test}_{ts}.png"))
+    animation_posterior(np.array(history["posteriors"], dtype=object), np.array(history["bgrids"], dtype=object), os.path.join(config.save_path ,f"Transverse_Posterior_Transverse_Test_{params.Test}_{ts}.gif"))
+    # animation_kl(np.array(expectedkl, dtype=object), f_bias_axis[f_index_1:f_index_2].get(), save_path = os.path.join(config.save_path , f"Transverse_KL_Transverse_Test_{params.Test}_{ts}.gif"))
+
+    # save_path_mode = os.path.join(config.save_path, f'Transverse_Mode_Convergence_MAP_Test_{params.Test}_{ts}.png')
+    # plt.plot(np.array(history["time"]), np.array(history["est"])/0.7, label=f"Mode Convergence", marker = '.')
+    # plt.xlabel("Time (microseconds)")
+    # plt.ylabel("Mode - Transverse Field Estimate (Gauss)")
+    # plt.title("Mode Convergence over experiments - Bayesian")
+    # plt.savefig(save_path_mode)
+
+    # save_path_std = os.path.join(config.save_path, f'Transverse_Std_Convergence_MAP_Test_{params.Test}_{ts}.png')
+    # plt.plot(np.array(history["time"]), np.array(history["stddev"])/0.7, label=f"Standard Deviation Convergence", marker = '.')
+    # plt.xlabel("Time (microseconds)")
+    # plt.ylabel("Standard Deviation (Gauss)")
+    # plt.title("Standard Deviation Convergence over experiments - Bayesian")
+    # plt.savefig(save_path_std)
 
     print("\n", f"Done in {time.time() - start_wall:.2f}s")
     return history
@@ -1436,7 +1575,7 @@ def run_experiment_y_estimation(
 
 def altopt(
     config: DataContext, 
-    params: ParameterContext,
+    params: ParameterContext, early_stop = False
 ):
     # ! load these arguments using some parameter context. 
     num_iter = params.num_iter
@@ -1508,11 +1647,12 @@ def altopt(
             print(f"Estimated Bz: {new_bz} (stable {stable_bz_runs}/{patience})")
 
             # Check combined early-stop condition
-            if (stable_bz_runs >= patience) and (stable_by_runs >= patience):
-                print(
-                    f"Early stopping at iteration {i + 1}: Bz and By stable for >= {patience} steps (tol_bz={tol_bz}, tol_by={tol_by})."
-                )
-                break
+            if early_stop:
+                if (stable_bz_runs >= patience) and (stable_by_runs >= patience):
+                    print(
+                        f"Early stopping at iteration {i + 1}: Bz and By stable for >= {patience} steps (tol_bz={tol_bz}, tol_by={tol_by})."
+                    )
+                    break
 
         return bz_history, by_history
 
@@ -1573,11 +1713,12 @@ def altopt(
             print(f"Estimated By: {new_by} (stable {stable_by_runs}/{patience})")
 
             # Check combined early-stop condition
-            if (stable_bz_runs >= patience) and (stable_by_runs >= patience):
-                print(
-                    f"Early stopping at iteration {i + 1}: Bz and By stable for >= {patience} steps (tol_bz={tol_bz}, tol_by={tol_by})."
-                )
-                break
+            if early_stop:
+                if (stable_bz_runs >= patience) and (stable_by_runs >= patience):
+                    print(
+                        f"Early stopping at iteration {i + 1}: Bz and By stable for >= {patience} steps (tol_bz={tol_bz}, tol_by={tol_by})."
+                    )
+                    break
 
         return bz_history, by_history
 
@@ -1590,7 +1731,7 @@ def plot_altopt(config, bz_history, by_history, trajectory_mode=True):
 
     # Plot for Bz
     plt.subplot(1, 3, 1)
-    plt.plot(iterations_bz, bz_history, marker="o")
+    plt.plot(iterations_bz, np.asarray(bz_history)/0.7, marker="o")
     plt.title("Convergence of Bz Estimates")
     plt.xlabel("Iteration")
     plt.ylabel("Bz")
@@ -1598,7 +1739,7 @@ def plot_altopt(config, bz_history, by_history, trajectory_mode=True):
 
     # Plot for By
     plt.subplot(1, 3, 2)
-    plt.plot(iterations_by, by_history, marker="o")
+    plt.plot(iterations_by, np.asarray(by_history)/0.7, marker="o")
     plt.title("Convergence of By Estimates")
     plt.xlabel("Iteration")
     plt.ylabel("By")
@@ -1608,12 +1749,12 @@ def plot_altopt(config, bz_history, by_history, trajectory_mode=True):
     if trajectory_mode:
         plt.subplot(1, 3, 3)
 
-        plt.plot(by_history, bz_history, marker="o")
+        plt.plot(np.asarray(by_history)/0.7, np.asarray(bz_history)/0.7, marker="o")
         plt.title("Trajectory of Estimates in By-Bz Space")
         plt.xlabel("By Estimates")
         plt.ylabel("Bz Estimates")
         plt.grid(True, alpha=0.3)
-        for idx, (by, bz) in enumerate(zip(by_history, bz_history), start=0):
+        for idx, (by, bz) in enumerate(zip(np.asarray(by_history)/0.7, np.asarray(bz_history)/0.7), start=0):
             plt.annotate(
                 str(idx),
                 (by, bz),

@@ -3,7 +3,11 @@ import numpy as np
 import pickle
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib import cm
+import matplotlib.colors as mcolors
 from matplotlib.animation import FuncAnimation
+from matplotlib.ticker import MaxNLocator
+plt.rcParams.update({'font.family': 'serif', 'font.size': 12})
 import cupy as cp
 from cupyx.scipy.ndimage import map_coordinates
 import time
@@ -11,7 +15,7 @@ from datetime import datetime
 from dataclasses import dataclass, replace
 from typing import Any, Mapping, Optional
 from scipy.interpolate import RegularGridInterpolator
-from matplotlib.ticker import MaxNLocator
+
 
 # Data loading
 @dataclass
@@ -1155,7 +1159,7 @@ def run_experiment_longitudinal_estimation(
         f_index_2 = cp.where(f_bias_axis > f_sim[-10])[0][0]
         
         #FIXME for random selection protocol tempolrarily disabling this
-        '''next_bias, expectedkl = calculate_kl_divergence_gpu(
+        next_bias, expectedkl = calculate_kl_divergence_gpu(
             posterior_gpu,
             b_grid_gpu,
             fixed_by_estimate,
@@ -1166,14 +1170,15 @@ def run_experiment_longitudinal_estimation(
             y_grid_size=params.kl_y_grid_size,
             sigma_noise=params.sigma_noise_longitudinal,
             batch_size=131,
-        )'''
+        )
 
-        random_bias = cp.random.choice(f_bias_axis[f_index_1:f_index_2], size=1, replace=False)
+        # random_bias = cp.random.choice(f_bias_axis[f_index_1:f_index_2], size=1, replace=False)
 
-        # history["expectedkl"].append(expectedkl.get()) FIXME
-        # curr_bias = min(max(next_bias, -1.5), 1.5)
+        history["expectedkl"].append(expectedkl.get()) #FIXME
+        curr_bias = next_bias
         #FIXME random field estimation protocol
-        curr_bias = random_bias[0]
+        # curr_bias = random_bias[0]
+        # curr_bias = 0
         time_cursor = t_next
 
     history_longitudinal_estimation = {
@@ -1196,23 +1201,26 @@ def run_experiment_longitudinal_estimation(
 
     #Plotting
 
+    save_path_mode = os.path.join(config.save_path, f'Longitudinal_Mode_Convergence_MAP_Test_{params.Test}_{ts}.png')
+    plt.plot(np.array(history["time"]), np.array(history["est"])/0.7, label=f"Mode Convergence", marker = '.')
+    plt.xlabel("Time (microseconds)")
+    plt.ylabel("Mode - Longitudinal Field Estimate (Gauss)")
+    plt.title("Mode Convergence over experiments - Bayesian")
+    plt.savefig(save_path_mode)
+    plt.close()
+
+    save_path_std = os.path.join(config.save_path, f'Longitudinal_Std_Convergence_MAP_Test_{params.Test}_{ts}.png')
+    plt.plot(np.array(history["time"]), np.array(history["stddev"])/0.7, label=f"Standard Deviation Convergence", marker = '.')
+    plt.xlabel("Time (microseconds)")
+    plt.ylabel("Standard Deviation (Gauss)")
+    plt.title("Standard Deviation Convergence over experiments - Bayesian")
+    plt.savefig(save_path_std)
+    plt.close()
+
     plot_heat_and_surface(t_exp.get(), f_bias_axis.get(), exp_matrix.get(), trajectory_mode=True, traj_bias = np.array(history["bias"]), curr_time = start_time, title_prefix="Bias Trajectory", save_path = os.path.join(config.save_path ,f"Bias_Trajectory_Longitudinal_Test_{params.Test}_{ts}.png"))
-    animation_posterior(np.array(history["posteriors"], dtype=object), np.array(history["bgrids"], dtype=object), os.path.join(config.save_path , f"Longitudinal_Test_{params.Test}_{ts}_Posterior.gif"))
+    plt.close()
+    # animation_posterior(np.array(history["posteriors"], dtype=object), np.array(history["bgrids"], dtype=object), os.path.join(config.save_path , f"Longitudinal_Test_{params.Test}_{ts}_Posterior.gif"))
     # animation_kl(np.array(history["expectedkl"], dtype=object), f_bias_axis[f_index_1:f_index_2].get(), save_path = os.path.join(config.save_path , f"Longitudinal_Test_{params.Test}_{ts}_KL.gif"))
-
-    # save_path_mode = os.path.join(config.save_path, f'Longitudinal_Mode_Convergence_MAP_Test_{params.Test}_{ts}.png')
-    # plt.plot(np.array(history["time"]), np.array(history["est"])/0.7, label=f"Mode Convergence", marker = '.')
-    # plt.xlabel("Time (microseconds)")
-    # plt.ylabel("Mode - Longitudinal Field Estimate (Gauss)")
-    # plt.title("Mode Convergence over experiments - Bayesian")
-    # plt.savefig(save_path_mode)
-
-    # save_path_std = os.path.join(config.save_path, f'Longitudinal_Std_Convergence_MAP_Test_{params.Test}_{ts}.png')
-    # plt.plot(np.array(history["time"]), np.array(history["stddev"])/0.7, label=f"Standard Deviation Convergence", marker = '.')
-    # plt.xlabel("Time (microseconds)")
-    # plt.ylabel("Standard Deviation (Gauss)")
-    # plt.title("Standard Deviation Convergence over experiments - Bayesian")
-    # plt.savefig(save_path_std)
 
     print("\n", f"Done in {time.time() - start_wall:.2f}s")
     return history
@@ -1521,15 +1529,16 @@ def run_experiment_y_estimation(
         f_index_2 = cp.where(f_bias_axis > f_sim[-10])[0][0]
 
         #FIXME for random selection protocol tempolrarily disabling this
-        '''next_bias, expectedkl = calculate_kl_by(
+        next_bias, expectedkl = calculate_kl_by(
             posterior_gpu, b_grid_gpu, sim_interp, t_fut_1, t_fut_2, f_bias_axis[f_index_1:f_index_2], fixed_bz_estimate=fixed_bz_estimate, sigma_noise=params.sigma_noise_transverse, batch_size=131, y_grid_size=params.kl_y_grid_size
-        )'''
+        )
 
-        random_bias = cp.random.choice(f_bias_axis[f_index_1:f_index_2], size=1, replace=False)
-        # history["expectedkl"].append(expectedkl.get())
-        # curr_bias_z = min(max(next_bias, -1.5), 1.5)
+        # random_bias = cp.random.choice(f_bias_axis[f_index_1:f_index_2], size=1, replace=False)
+        history["expectedkl"].append(expectedkl.get())
+        curr_bias_z = next_bias
         # FIXME uniform field estimation protocol
-        curr_bias_z = random_bias[0]
+        # curr_bias_z = random_bias[0]
+        # curr_bias_z = 0
         time_cursor = t_next
 
     history_y_estimation = {
@@ -1550,24 +1559,27 @@ def run_experiment_y_estimation(
     print(f"Results for Transverse Field, Test_{params.Test}_{ts} saved successfully.", end=" ")
 
     #Plotting
+    
+    save_path_mode = os.path.join(config.save_path, f'Transverse_Mode_Convergence_MAP_Test_{params.Test}_{ts}.png')
+    plt.plot(np.array(history["time"]), np.array(history["est"])/0.7, label=f"Mode Convergence", marker = '.')
+    plt.xlabel("Time (microseconds)")
+    plt.ylabel("Mode - Transverse Field Estimate (Gauss)")
+    plt.title("Mode Convergence over experiments - Bayesian")
+    plt.savefig(save_path_mode)
+    plt.close()
+
+    save_path_std = os.path.join(config.save_path, f'Transverse_Std_Convergence_MAP_Test_{params.Test}_{ts}.png')
+    plt.plot(np.array(history["time"]), np.array(history["stddev"])/0.7, label=f"Standard Deviation Convergence", marker = '.')
+    plt.xlabel("Time (microseconds)")
+    plt.ylabel("Standard Deviation (Gauss)")
+    plt.title("Standard Deviation Convergence over experiments - Bayesian")
+    plt.savefig(save_path_std)
+    plt.close()
 
     plot_heat_and_surface(t_exp.get(), f_bias_axis.get(), exp_matrix.get(), trajectory_mode=True, traj_bias = np.array(history["bias"]), curr_time = params.curr_time, title_prefix="Bias Trajectory", save_path = os.path.join(config.save_path, f"Bias_Trajectory_Transverse_Test_{params.Test}_{ts}.png"))
-    animation_posterior(np.array(history["posteriors"], dtype=object), np.array(history["bgrids"], dtype=object), os.path.join(config.save_path ,f"Transverse_Posterior_Transverse_Test_{params.Test}_{ts}.gif"))
+    plt.close()
+    # animation_posterior(np.array(history["posteriors"], dtype=object), np.array(history["bgrids"], dtype=object), os.path.join(config.save_path ,f"Transverse_Posterior_Transverse_Test_{params.Test}_{ts}.gif"))
     # animation_kl(np.array(expectedkl, dtype=object), f_bias_axis[f_index_1:f_index_2].get(), save_path = os.path.join(config.save_path , f"Transverse_KL_Transverse_Test_{params.Test}_{ts}.gif"))
-
-    # save_path_mode = os.path.join(config.save_path, f'Transverse_Mode_Convergence_MAP_Test_{params.Test}_{ts}.png')
-    # plt.plot(np.array(history["time"]), np.array(history["est"])/0.7, label=f"Mode Convergence", marker = '.')
-    # plt.xlabel("Time (microseconds)")
-    # plt.ylabel("Mode - Transverse Field Estimate (Gauss)")
-    # plt.title("Mode Convergence over experiments - Bayesian")
-    # plt.savefig(save_path_mode)
-
-    # save_path_std = os.path.join(config.save_path, f'Transverse_Std_Convergence_MAP_Test_{params.Test}_{ts}.png')
-    # plt.plot(np.array(history["time"]), np.array(history["stddev"])/0.7, label=f"Standard Deviation Convergence", marker = '.')
-    # plt.xlabel("Time (microseconds)")
-    # plt.ylabel("Standard Deviation (Gauss)")
-    # plt.title("Standard Deviation Convergence over experiments - Bayesian")
-    # plt.savefig(save_path_std)
 
     print("\n", f"Done in {time.time() - start_wall:.2f}s")
     return history
@@ -1732,6 +1744,7 @@ def plot_altopt(config, bz_history, by_history, trajectory_mode=True):
     # Plot for Bz
     plt.subplot(1, 3, 1)
     plt.plot(iterations_bz, np.asarray(bz_history)/0.7, marker="o")
+    plt.axhline(y=np.asarray(bz_history)[-1]/0.7, color='r', linestyle='--', linewidth=2, label = "Final Estimate")
     plt.title("Convergence of Bz Estimates")
     plt.xlabel("Iteration")
     plt.ylabel("Bz")
@@ -1740,6 +1753,7 @@ def plot_altopt(config, bz_history, by_history, trajectory_mode=True):
     # Plot for By
     plt.subplot(1, 3, 2)
     plt.plot(iterations_by, np.asarray(by_history)/0.7, marker="o")
+    plt.axhline(y=np.asarray(by_history)[-1]/0.7, color='r', linestyle='--', linewidth=2, label = "Final Estimate")
     plt.title("Convergence of By Estimates")
     plt.xlabel("Iteration")
     plt.ylabel("By")

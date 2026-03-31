@@ -386,8 +386,8 @@ def load_experiment(config: DataContext, Aligned=DATASET3.Aligned):
         raw_data = raw_data[__:,]
         print(f"  > Exp Start: {t_exp_0:.4f}s")
     
-    #this is for the new dataset frmo 13/02 only FIXME
-    t = t * 1e6
+    #this is for the dataset from 13/02 only FIXME
+    # t = t * 1e6
     t_index = np.where(np.asarray(t)>70)[0][0]
     f_index_1 = np.where(np.asarray(f_bias)<-1.5)[0][0]
     f_index_2 = np.where(np.asarray(f_bias)>1.5)[0][0]
@@ -440,7 +440,7 @@ def plot_heat_and_surface(
     plt.title(f"{title_prefix} heatmap (rows=time, cols=freq)")
     plt.tight_layout()
     if save_path != "": 
-        plt.savefig(save_path)
+        plt.savefig(save_path); plt.close()
     if save_path == "": plt.show()
     # 3D surface (might be heavy)
     fig = plt.figure(figsize=(9, 6))
@@ -452,6 +452,7 @@ def plot_heat_and_surface(
     plt.title(f"{title_prefix} 3D surface")
     plt.tight_layout()
     if save_path == "": plt.show()
+    if save_path != "": plt.close()
 
 
 def plot_slice(by_idx, file_path):
@@ -507,6 +508,7 @@ def animation_posterior(posteriors, bgrid, save_path):
 
     # Option 2: Save as GIF (No external dependencies usually)
     anim.save(save_path, writer='pillow', fps=4)
+    anim.close()
 
 def animation_kl(expectedkl, f_bias_axis, save_path):
     # Setup figure
@@ -543,6 +545,7 @@ def animation_kl(expectedkl, f_bias_axis, save_path):
 
     # Option 2: Save as GIF (No external dependencies usually)
     anim.save(save_path, writer='pillow', fps=4)
+    anim.close()
 
 
     # interpolator and interpolation validator for Y field estimation
@@ -599,7 +602,6 @@ def get_predictions_batch(interpolator, t_pts, z_vals, y_grid):
         predictions = interpolator.interpolate(T_mesh.ravel(), Z_mesh.ravel(), Y_mesh.ravel())
         return predictions.reshape(final_shape)       
     
-    #FIXME; write get prediction for Likelihood for transverse likelihood here, Bz has 1 dimension instead of the zero earlier 
     # y grid is 1 dim, b grid is 1 dim, and time is also 1 dim
     elif t_pts.ndim == 1 and y_grid.ndim == 1 and z_vals.ndim == 1:
         T_array = t_pts[:,None,None]
@@ -1192,7 +1194,7 @@ def run_experiment_longitudinal_estimation(
         "expectedkl": np.array(history["expectedkl"], dtype=object),
     }
 
-    ts = datetime.now().strftime("%d_%m_%Y__%H_%M_%S")
+    ts = datetime.now().strftime("%d_%m_%Y_%H_%M_%S")
     np.savez_compressed(
         f"{config.save_path}/longitudinal_estimation_results_{params.Test}_{ts}.npz",
         **history_longitudinal_estimation,
@@ -1203,6 +1205,7 @@ def run_experiment_longitudinal_estimation(
 
     save_path_mode = os.path.join(config.save_path, f'Longitudinal_Mode_Convergence_MAP_Test_{params.Test}_{ts}.png')
     plt.plot(np.array(history["time"]), np.array(history["est"])/0.7, label=f"Mode Convergence", marker = '.')
+    plt.axhline(y=history["est"][-1]/0.7, color='r', linestyle='--', label=f"Final Estimate {history['est'][-1]/0.7:.3f}")
     plt.xlabel("Time (microseconds)")
     plt.ylabel("Mode - Longitudinal Field Estimate (Gauss)")
     plt.title("Mode Convergence over experiments - Bayesian")
@@ -1211,6 +1214,7 @@ def run_experiment_longitudinal_estimation(
 
     save_path_std = os.path.join(config.save_path, f'Longitudinal_Std_Convergence_MAP_Test_{params.Test}_{ts}.png')
     plt.plot(np.array(history["time"]), np.array(history["stddev"])/0.7, label=f"Standard Deviation Convergence", marker = '.')
+    plt.scatter(x=history["time"][-1], y=history["stddev"][-1]/0.7, color='r', linestyle='--', label=f"Final Std Dev {history['stddev'][-1]/0.7:.3f}") 
     plt.xlabel("Time (microseconds)")
     plt.ylabel("Standard Deviation (Gauss)")
     plt.title("Standard Deviation Convergence over experiments - Bayesian")
@@ -1551,7 +1555,7 @@ def run_experiment_y_estimation(
         "bgrids": np.array(history["bgrids"], dtype=object),
         "expectedkl": np.array(history["expectedkl"], dtype=object),
     }
-    ts = datetime.now().strftime("%d_%m_%Y__%H_%M_%S")
+    ts = datetime.now().strftime("%d_%m_%Y_%H_%M_%S")
     np.savez_compressed(
         f"{config.save_path}/transverse_field_estimation_results_{params.Test}_{ts}.npz",
         **history_y_estimation,
@@ -1562,6 +1566,7 @@ def run_experiment_y_estimation(
     
     save_path_mode = os.path.join(config.save_path, f'Transverse_Mode_Convergence_MAP_Test_{params.Test}_{ts}.png')
     plt.plot(np.array(history["time"]), np.array(history["est"])/0.7, label=f"Mode Convergence", marker = '.')
+    plt.axhline(y=history["est"][-1]/0.7, color='r', linestyle='--', label=f"Final Estimate {history['est'][-1]/0.7:.3f}")
     plt.xlabel("Time (microseconds)")
     plt.ylabel("Mode - Transverse Field Estimate (Gauss)")
     plt.title("Mode Convergence over experiments - Bayesian")
@@ -1570,6 +1575,7 @@ def run_experiment_y_estimation(
 
     save_path_std = os.path.join(config.save_path, f'Transverse_Std_Convergence_MAP_Test_{params.Test}_{ts}.png')
     plt.plot(np.array(history["time"]), np.array(history["stddev"])/0.7, label=f"Standard Deviation Convergence", marker = '.')
+    plt.scatter(x=history["time"][-1], y=history["stddev"][-1]/0.7, color='r', linestyle='--', label=f"Final Std Dev {history['stddev'][-1]/0.7:.3f}") 
     plt.xlabel("Time (microseconds)")
     plt.ylabel("Standard Deviation (Gauss)")
     plt.title("Standard Deviation Convergence over experiments - Bayesian")

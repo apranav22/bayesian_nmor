@@ -1,3 +1,4 @@
+from email.mime import base
 import os
 import numpy as np
 import pickle
@@ -15,7 +16,7 @@ from datetime import datetime
 from dataclasses import dataclass, replace
 from typing import Any, Mapping, Optional
 from scipy.interpolate import RegularGridInterpolator
-
+from scipy.ndimage import spline_filter
 
 # Data loading
 @dataclass
@@ -45,7 +46,8 @@ class DataContext:
     exp_data: str
     interpolator: Optional[str]
     save_path: str = f"Results/Dataset_7/Test_{datetime.now().date().strftime('%d_%m_%Y')}"
-    Aligned: bool = False
+    Sim_Aligned: bool = False
+    Exp_Aligned: bool = False
 
     # Pulse parameters
     sim_pulse_thresh: float = 0.3
@@ -105,6 +107,8 @@ class ParameterContext:
     init_resolution_transverse: float = 0.0001
     sigma_noise_longitudinal: float = 0.1
     sigma_noise_transverse: float = 0.1
+    likelihood_mode_longitudinal: str = "Gaussian"
+    likelihood_mode_transverse: str = "Gaussian"
     f_bias_offset_nuisance: float = 0.0
     Est_First_Z: bool = False
 
@@ -113,7 +117,7 @@ class ParameterContext:
     exp_pulse_thresh: float = 0.3
     
     # Adaptive experiment/grid
-    kl_y_grid_size: int = 200
+    kl_y_grid_size: int = 50
 
     # AltOpt parameters
     num_iter: int = 5
@@ -156,7 +160,7 @@ class ParameterContext:
         return (len(problems) == 0, problems)
 
 class GPUInterpolator:
-    def __init__(self, t_axis = None, f_axis = None, by_axis = None, data_cube = None):
+    def __init__(self, t_axis = None, f_axis = None, by_axis = None, data_cube = None, coeffs_cpu = None):
         if data_cube is not None:
             self.t_axis = cp.asarray(t_axis)
             self.f_axis = cp.asarray(f_axis)
@@ -217,6 +221,9 @@ class GPUInterpolator:
                 """,
                 name = "trilinear_extrapolation_and_interpolation_kernel"
             )
+            
+            # Push the finalized cubic spline coefficients to the GPU memory
+            self.coeffs_gpu : cp.ndarray
 
     def to_indices(self, t_query, f_query, by_query):
         t_idx = (t_query - self.t_start) / self.t_step
@@ -232,9 +239,17 @@ class GPUInterpolator:
     def interpolate(self, t_query, f_query, by_query):  
         # Note: Query the flattened arrays directly to keep calculations simple and efficient
         t_idx, f_idx, by_idx = self.to_indices(t_query, f_query, by_query)
-        # coords = cp.stack([t_idx, f_idx, by_idx], axis = 0)
+        coords = cp.stack([t_idx, f_idx, by_idx], axis = 0)
+        # predictions = map_coordinates(
+        #     self.coeffs_gpu, 
+        #     coords, 
+        #     order=3, 
+        #     mode='nearest', 
+        #     prefilter=False 
+        # )
         # predictions = map_coordinates(self.data_cube, coords, order=1, mode='nearest')
         return self.kernel(t_idx.astype(cp.float64), f_idx.astype(cp.float64), by_idx.astype(cp.float64), self.data_cube, self.nt, self.nz, self.ny)
+        # return cp.clip(predictions, 0.0, 1.0)
     
     def save(self, filepath):
         np.savez(filepath, 
@@ -247,6 +262,23 @@ class GPUInterpolator:
                 self.by_start, self.by_step
                 ]),
                  data_cube=cp.asnumpy(self.data_cube))
+        # base = os.path.splitext(filepath)[0] # "document"
+        # new_path = base + ".npy"
+        # filepath_1 = new_path
+        # if os.path.exists(filepath_1):
+        #         print(f"Loading pre-computed cubic spline coefficients from: {filepath_1}")
+        #         coeffs_cpu = np.load(filepath_1)
+        # else:
+        #     print("Cubic spline coefficients not found. Computing IIR filter...")
+        #     print("This may take a minute, but will only happen once for this dataset.")
+        
+        #     # Calculate the coefficients on the CPU using SciPy
+        #     coeffs_cpu = spline_filter(self.data_cube.get(), order=3)
+        
+        #     # Save the numpy array so we bypass this step in future runs
+        #     np.save(filepath_1, coeffs_cpu)
+        #     print(f"Coefficients saved successfully to: {filepath_1}")
+        # self.coeffs_gpu = cp.asarray(coeffs_cpu)
         
     @classmethod
     def load(cls, filepath):
@@ -257,10 +289,15 @@ class GPUInterpolator:
         data_cube = cp.asarray(loaded['data_cube'], dtype = cp.float64)
         meta = loaded['metadata']
 
+        base = os.path.splitext(filepath)[0] # "document"
+        new_path = base + ".npy"
+        filepath_1 = new_path
         #i dont need to pass time, by, bz because all that matters are the min and steps, which have been passed
         instance = cls()
-        instance.data_cube = data_cube
+        # coeffs_cpu = np.load(filepath_1)
         instance.by_axis = by_axis
+        instance.data_cube = data_cube
+        # instance.coeffs_gpu = cp.asarray(coeffs_cpu)
         instance.nt, instance.nz, instance.ny = data_cube.shape
         instance.t_start, instance.t_step = float(meta[0]), float(meta[1])
         instance.f_start, instance.f_step = float(meta[2]), float(meta[3])
@@ -313,7 +350,8 @@ DATASET3 = DataContext(
     exp_freq_axis = r"DataFiles_to_Dinesh_Pranav\Data_files\Experiment\Y_MHz_Exp.csv",
     exp_data = r"DataFiles_to_Dinesh_Pranav\Data_files\Experiment\Probe_trans_Exp.csv",
     interpolator=r"DataFiles_to_Dinesh_Pranav\Data_files\Simulation\Dataset_7\gpu_sim_interpolator_new_normalisation_linear_0.3_threshold.npz",
-    Aligned = False
+    Sim_Aligned = False,
+    Exp_Aligned = False
 )
 
 
@@ -326,7 +364,7 @@ def find_pulse_start(trace, t_axis, threshold):
     return t_axis[0], 0
 
 
-def load_simulation_cube(config: DataContext):
+def load_simulation_cube(config: DataContext, Aligned=DATASET3.Sim_Aligned):
     """Load simulation axes and cube using DataContext paths."""
     print("...Loading Simulation Cube Data...")
     to = time.time()
@@ -339,17 +377,20 @@ def load_simulation_cube(config: DataContext):
     )
 
     t_sim_0, _ = 0.0, 0
+    t_axis_0 = t_axis
+    Aligned = config.Sim_Aligned
     matrix_list = []
     for fname in config.sim_intensities:
         data = pd.read_csv(fname, header=None).values
 
         if data.shape != (len(t_axis), len(f_axis)):
             data = data.T
-        if len(matrix_list) == 0:
-            scale = 1 / (np.max(data) - np.min(data))
-            calibrated_data = (data - np.min(data)) * scale
-            calibrated_data = np.clip(calibrated_data, 0.0, 1.0)
-            t_sim_0, _ = find_pulse_start(calibrated_data[:, 0], t_axis, config.sim_pulse_thresh)
+        if not Aligned:
+            if len(matrix_list) == 0:
+                scale = 1 / (np.max(data) - np.min(data))
+                calibrated_data = (data - np.min(data)) * scale
+                calibrated_data = np.clip(calibrated_data, 0.0, 1.0)
+                t_sim_0, _ = find_pulse_start(calibrated_data[:, 0], t_axis, config.sim_pulse_thresh)
 
             t_axis_0 = t_axis[_:] - t_sim_0
 
@@ -366,7 +407,7 @@ def load_simulation_cube(config: DataContext):
     return t_axis_0, f_axis, by_axis, cube
 
 
-def load_experiment(config: DataContext, Aligned=DATASET3.Aligned):
+def load_experiment(config: DataContext, Aligned=DATASET3.Exp_Aligned):
     to = time.time()
     print(f"Loading Experiment from {config.exp_data}...")
     t = pd.read_csv(config.exp_time, header=None).values.flatten()
@@ -421,7 +462,7 @@ def plot_heat_and_surface(
     plt.figure(figsize=(8, 5))
     plt.pcolormesh(Xg, Yg, Z_arr, shading="auto")
     plt.xlabel("Time (microseconds)")
-    plt.ylabel("Applied Bias Field (Gauss)")
+    plt.ylabel("Applied Bias Field ($\mu T$)")
     if trajectory_mode:
         curr_time_index = np.searchsorted(X_vec, curr_time)
         traj_bias = np.repeat(
@@ -446,32 +487,13 @@ def plot_heat_and_surface(
     fig = plt.figure(figsize=(9, 6))
     ax = fig.add_subplot(111, projection="3d")
     ax.plot_surface(Yg, Xg, Z_arr, cmap="viridis", linewidth=0, antialiased=True)
-    ax.set_xlabel("Applied Bias Field (Gauss)")
+    ax.set_xlabel("Applied Bias Field ($\mu T$)")
     ax.set_ylabel("Time (microseconds)")
     ax.set_zlabel("Probe Transmitted Intensity")
     plt.title(f"{title_prefix} 3D surface")
     plt.tight_layout()
     if save_path == "": plt.show()
     if save_path != "": plt.close()
-
-
-def plot_slice(by_idx, file_path):
-    t_sim, f_sim, by_sim, sim_cube = load_simulation_cube(file_path)
-    plt.figure(figsize=(10, 6))
-    data_slice = sim_cube[:, :, by_idx].T
-
-    plt.imshow(
-        data_slice,
-        aspect="auto",
-        origin="lower",
-        extent=(t_sim[0], t_sim[-1], f_sim[0], f_sim[-1]),
-        cmap="viridis",
-    )
-    plt.colorbar(label="Intensity")
-    plt.title(f"Simulation Slice at By = {by_sim[by_idx]:.2f}")
-    plt.xlabel("Time")
-    plt.ylabel("Frequency")
-    plt.show()
 
 def animation_posterior(posteriors, bgrid, save_path):
     # Setup figure
@@ -498,7 +520,7 @@ def animation_posterior(posteriors, bgrid, save_path):
         # Rescale axes dynamically to fit the new zoomed/peaked distribution
         ax.set_xlim(x.min(), x.max())
         ax.set_ylim(0, y.max() * 1.1)
-        ax.set_xlabel("Field (Gauss)"); ax.set_ylabel("Probability Density")
+        ax.set_xlabel("Field ($\mu T$)"); ax.set_ylabel("Probability Density")
         ax.set_title(f"Posterior Step {frame}")
         return line,
 
@@ -535,7 +557,7 @@ def animation_kl(expectedkl, f_bias_axis, save_path):
         # Rescale axes dynamically to fit the new zoomed/peaked distribution
         ax.set_xlim(x.min(), x.max())
         ax.set_ylim(0, y.max() * 1.1)
-        ax.set_xlabel("Longitudinal Bias Field (Gauss)")
+        ax.set_xlabel("Longitudinal Bias Field ($\mu T$)")
         ax.set_title(f"Expected_KL {frame}")
         return line,
 
@@ -567,32 +589,53 @@ def get_final_interpolator(config: Optional[DataContext], params: ParameterConte
     return t_sim, f_sim, by_sim, full_interp
 
 #interpolator predictions
-def get_predictions_batch(interpolator, t_pts, z_vals, y_grid):   
+def get_predictions_batch(interpolator, t_pts, z_vals, y_grid, mode = ""):   
     #the two elif conditions are for the case of querying in the longitudinal estimation run
     #with the first elif being used by the KL divergence step and second being used by the likelihood
     #distinction necessary because of the different array shapes based on context
     if (cp.isscalar(y_grid) or y_grid.ndim == 0) and t_pts.ndim == 0:
         # T_mesh, Z_mesh = np.meshgrid(t_pts, z_vals, indexing='ij')
+        to = time.time()
         T_mesh = cp.full_like(z_vals, t_pts, dtype=float)
         Z_mesh = z_vals
         Y_mesh = cp.full_like(T_mesh, y_grid)
         predictions = interpolator.interpolate(T_mesh.ravel(), Z_mesh.ravel(), Y_mesh.ravel())
+        print(time.time() - to,"was the time taken to compute the Interpolated Values.|", end=" ")
         return predictions.reshape(T_mesh.shape)
     
     #for longiduinal case, i need to make the edit here for the marginalisation of Bz FIXME: Havent done marginalisation part for KL divergence, implement that as well
-    elif (cp.isscalar(y_grid) or y_grid.ndim == 0) and z_vals.ndim == 2:
+    elif mode == "Longitudinal Likelihood":
+        to = time.time()
         # T_mesh, Z_mesh = np.meshgrid(t_pts, z_vals, indexing='ij')
         # Y_mesh = np.full_like(T_mesh, y_grid)
-        T_array = t_pts[:,None,None]
-        Z_mesh = z_vals[None,:,:]
-        final_shape = (T_array.shape[0], Z_mesh.shape[1], Z_mesh.shape[2])
+        T_array = t_pts[:,None,None, None]
+        Z_mesh = z_vals[None,:,:, None]
+        Y_mesh = y_grid[None,None,None,:]
+        final_shape = (T_array.shape[0], Z_mesh.shape[1], Z_mesh.shape[2], Y_mesh.shape[3])
         T_mesh = cp.broadcast_to(T_array, final_shape)
-        Z_mesh = cp.broadcast_to(Z_mesh, final_shape)
-        Y_mesh = cp.full_like(T_mesh, y_grid)
+        Z_mesh = cp.broadcast_to(Z_mesh, final_shape) 
+        Y_mesh = cp.broadcast_to(Y_mesh, final_shape)
         predictions = interpolator.interpolate(T_mesh.ravel(), Z_mesh.ravel(), Y_mesh.ravel())
+        print(time.time() - to,"was the time taken to compute the Interpolated Values.|", end=" ")
         return predictions.reshape(final_shape)    
     
-    elif (cp.isscalar(y_grid) or y_grid.ndim == 0):
+    elif mode == "Longitudinal Likelihood Frequentist":
+        to = time.time()
+        # T_mesh, Z_mesh = np.meshgrid(t_pts, z_vals, indexing='ij')
+        # Y_mesh = np.full_like(T_mesh, y_grid)
+        T_array = cp.asarray([t_pts])[:,None,None, None]
+        Z_mesh = z_vals[None,:,:, None]
+        Y_mesh = y_grid[None,None,None,:]
+        final_shape = (T_array.shape[0], Z_mesh.shape[1], Z_mesh.shape[2], Y_mesh.shape[3])
+        T_mesh = cp.broadcast_to(T_array, final_shape)
+        Z_mesh = cp.broadcast_to(Z_mesh, final_shape) 
+        Y_mesh = cp.broadcast_to(Y_mesh, final_shape)
+        predictions = interpolator.interpolate(T_mesh.ravel(), Z_mesh.ravel(), Y_mesh.ravel())
+        print(time.time() - to,"was the time taken to compute the Interpolated Values.|", end=" ")
+        return predictions.reshape(final_shape)    
+    
+    elif mode == "Longitudinal KL":
+        to = time.time()
         T_array = t_pts[:,None]
         Z_mesh = z_vals[None,:]
         final_shape = (T_array.shape[0], Z_mesh.shape[1])
@@ -600,21 +643,25 @@ def get_predictions_batch(interpolator, t_pts, z_vals, y_grid):
         Z_mesh = cp.broadcast_to(Z_mesh, final_shape)
         Y_mesh = cp.full_like(T_mesh, y_grid)
         predictions = interpolator.interpolate(T_mesh.ravel(), Z_mesh.ravel(), Y_mesh.ravel())
+        print(time.time() - to,"was the time taken to compute the Interpolated Values.|", end=" ")
         return predictions.reshape(final_shape)       
     
-    # y grid is 1 dim, b grid is 1 dim, and time is also 1 dim
-    elif t_pts.ndim == 1 and y_grid.ndim == 1 and z_vals.ndim == 1:
-        T_array = t_pts[:,None,None]
-        Z_mesh = z_vals[None,:,None]     
-        Y_mesh = y_grid[None,None,:]
-        final_shape = (T_array.shape[0], z_vals.shape[0], y_grid.shape[0])
+    #FIXME; write get prediction for Likelihood for transverse likelihood here, Bz has 1 dimension instead of the zero earlier 
+    elif mode == "Transverse Likelihood":
+        to = time.time()
+        T_array = t_pts[:,None, None,None]
+        Z_mesh = z_vals[None,:,:,None]     
+        Y_mesh = y_grid[None,None, None,:]
+        final_shape = (T_array.shape[0], Z_mesh.shape[1], Z_mesh.shape[2], Y_mesh.shape[3])
         T_mesh = cp.broadcast_to(T_array, final_shape)
         Z_mesh = cp.broadcast_to(Z_mesh, final_shape)
         Y_mesh = cp.broadcast_to(Y_mesh, final_shape)
         predictions = interpolator.interpolate(T_mesh.flatten(), Z_mesh.flatten(), Y_mesh.flatten())
-        return predictions.reshape(T_mesh.shape)
+        print(time.time() - to,"was the time taken to compute the Interpolated Values.|", end=" ")
+        return predictions.reshape(final_shape)
     
     else:
+        to = time.time()
         T_array = cp.asarray([t_pts])[:,None,None]
         Z_mesh = z_vals[None,:,None]     
         Y_mesh = y_grid[None,None,:]
@@ -623,12 +670,12 @@ def get_predictions_batch(interpolator, t_pts, z_vals, y_grid):
         Z_mesh = cp.broadcast_to(Z_mesh, final_shape)
         Y_mesh = cp.broadcast_to(Y_mesh, final_shape)
         predictions = interpolator.interpolate(T_mesh.flatten(), Z_mesh.flatten(), Y_mesh.flatten())
+        print(time.time() - to,"was the time taken to compute the Interpolated Values.|", end=" ")
         return predictions.reshape(final_shape[1:])
 
 # Likelihood and KL for Longtudinal Estimation
-#FIXME introduce Z score standardisation
 def calculate_likelihood_gpu(
-    y_meas, t_sim_abs, curr_bias, candidate_biases, y_grid, b_grid_gpu, sim_spline, sigma_noise = DEFAULT_PARAMS.sigma_noise_longitudinal
+    y_meas, t_sim_abs, curr_bias, candidate_biases, y_grid, b_grid_gpu, sim_spline, sigma_noise = DEFAULT_PARAMS.sigma_noise_longitudinal, likelihood_mode = "Gaussian"
 ):
     to = time.time()
     candidate_biases_gpu = cp.array(candidate_biases)
@@ -641,26 +688,39 @@ def calculate_likelihood_gpu(
     marginalisation_prob_density = marginalisation_prob_density + 1/(candidate_biases_gpu[end_idx-1] - candidate_biases_gpu[start_idx]) # set the current bias to zero so that it is not included in marginalisation
     marginalisation_prob_density = marginalisation_prob_density*(candidate_biases_gpu[1]-candidate_biases_gpu[0])
 
-    y_theory_gpu = cp.asarray(get_predictions_batch(sim_spline, t_sim_abs, f_total_query, y_grid))
-    y_meas_gpu = cp.asarray(y_meas)
+    y_theory_gpu = get_predictions_batch(sim_spline, t_sim_abs, f_total_query, y_grid, mode = "Longitudinal Likelihood")
 
-    resid_sq = (y_meas_gpu[:, None, None] - y_theory_gpu)**2
-    sse = cp.sum(resid_sq, axis=0)
+    if likelihood_mode == "Gaussian":
+        resid_sq = (y_meas[:, None, None, None] - y_theory_gpu)**2
+        sse = cp.sum(resid_sq, axis=0)
+        log_L = -sse / (2 * sigma_noise**2)
+        L = cp.exp(log_L - cp.max(log_L))
+        L = L*marginalisation_prob_density[None, :, None]
+        L = cp.sum(L, axis=1)
+        L = cp.sum(L, axis=1)
+        log_L = cp.log(L + 1e-15) 
+        del y_theory_gpu, y_meas, resid_sq, L
+        cp.get_default_memory_pool().free_all_blocks()
+        if cp.any(cp.isnan(log_L)):
+            print("WARNING: NaNs detected in Likelihood!")
+            print(f"Min SSE: {cp.min(sse)}, Max LogL: {cp.max(log_L)}")
 
-    log_L = -sse / (2 * sigma_noise**2)
-    L = cp.exp(log_L - cp.max(log_L))
-    L = L*marginalisation_prob_density[None, :]
-    L = cp.sum(L, axis=1)
-    log_L = cp.log(L + 1e-15) 
-    del y_theory_gpu, y_meas_gpu, resid_sq, L
-    cp.get_default_memory_pool().free_all_blocks()
-    if cp.any(cp.isnan(log_L)):
-        print("WARNING: NaNs detected in Likelihood!")
-        print(f"Min SSE: {cp.min(sse)}, Max LogL: {cp.max(log_L)}")
-
-    print(time.time() - to,"was the time taken to compute the likelihood.|", end=" ")
-    return log_L - cp.max(log_L)
-
+        print(time.time() - to,"was the time taken to compute the likelihood.|", end=" ")
+        return log_L - cp.max(log_L)
+    elif likelihood_mode == "Cauchy":
+        gamma_cauchy = sigma_noise * 1.177
+        resid_sq = 1 + ((y_meas[:, None, None, None] - y_theory_gpu)**2/gamma_cauchy**2)
+        log_resid_sq = cp.log(resid_sq)
+        log_L = -cp.sum(log_resid_sq, axis=0)
+        L = cp.exp(log_L - cp.max(log_L))
+        L = L*marginalisation_prob_density[None, :, None]
+        L = cp.sum(L, axis=1)
+        L = cp.sum(L, axis=1)
+        log_L = cp.log(L + 1e-15) 
+        del y_theory_gpu, y_meas, resid_sq, log_resid_sq, L
+        cp.get_default_memory_pool().free_all_blocks()
+        return log_L - cp.max(log_L)
+    
 def calculate_kl_divergence_gpu(
     posterior_gpu,
     b_grid_gpu,
@@ -669,7 +729,7 @@ def calculate_kl_divergence_gpu(
     t_next_start,
     t_next_end,
     candidate_biases,
-    batch_size=10,
+    batch_size=50,
     y_grid_size=DEFAULT_PARAMS.kl_y_grid_size,
     sigma_noise=DEFAULT_PARAMS.sigma_noise_longitudinal
 ):
@@ -714,7 +774,6 @@ def calculate_kl_divergence_gpu(
 
 
 # KL and Likelihood for Y field Estimation
-#FIXME introduce Z score standardisation
 def calculate_likelihood_by(
     y_meas,
     t_chunk_sim,
@@ -723,34 +782,50 @@ def calculate_likelihood_by(
     by_grid_gpu,
     sim_interp,
     sigma_noise=DEFAULT_PARAMS.sigma_noise_transverse,
-    fixed_bz_estimate=DEFAULT_PARAMS.fixed_bz_estimate
+    fixed_bz_estimate=DEFAULT_PARAMS.fixed_bz_estimate, 
+    likelihood_mode = "Gaussian"
 ):
     to = time.time()
     curr_bias_idx = int(cp.where(candidate_biases == current_bias_z)[0][0])
     start_idx = max(0, curr_bias_idx - 1)
     end_idx = min(len(candidate_biases)-1, curr_bias_idx + 2)
-    z_total = fixed_bz_estimate + candidate_biases[start_idx:end_idx]
-    y_pred_gpu = get_predictions_batch(sim_interp, t_chunk_sim, z_total, by_grid_gpu)
+    z_total = fixed_bz_estimate[:, None] + candidate_biases[None, start_idx:end_idx]
+    y_pred_gpu = get_predictions_batch(sim_interp, t_chunk_sim, z_total, by_grid_gpu, mode = "Transverse Likelihood")
     dy_pred_gpu = cp.diff(y_pred_gpu, axis=0)
 
     marginalisation_prob_density = cp.zeros_like(candidate_biases[start_idx:end_idx])
     marginalisation_prob_density = marginalisation_prob_density + 1/(candidate_biases[end_idx-1] - candidate_biases[start_idx]) # set the current bias to zero so that it is not included in marginalisation
     marginalisation_prob_density = marginalisation_prob_density * (candidate_biases[1]-candidate_biases[0])
 
-    y_meas_gpu = cp.asarray(y_meas)
-    dy_meas_gpu = cp.diff(y_meas_gpu, axis=0)
-    resid_sq = (y_meas_gpu[:, None, None] - y_pred_gpu)**2
 
-    sse = cp.sum(resid_sq, axis=0)
-    log_L = -sse/(2* sigma_noise**2)
-    L = cp.exp(log_L - cp.max(log_L))
-    L = L*marginalisation_prob_density[:, None]
-    L = cp.sum(L, axis=0)
-    log_L = cp.log(L + 1e-15) 
-    del y_pred_gpu, y_meas_gpu, resid_sq, L
-    cp.get_default_memory_pool().free_all_blocks()
-    print(time.time() - to,"was the time taken to compute the Transverse Likelihood calculation. |", end=" ")
-    return log_L - cp.max(log_L)
+    # dy_meas = cp.diff(y_meas, axis=0)
+    if likelihood_mode == "Gaussian":
+        resid_sq = (y_meas[:, None, None, None] - y_pred_gpu)**2
+
+        sse = cp.sum(resid_sq, axis=0)
+        log_L = -sse/(2* sigma_noise**2)
+        L = cp.exp(log_L - cp.max(log_L))
+        L = L*marginalisation_prob_density[None, :, None]
+        L = cp.sum(L, axis=0)
+        L = cp.sum(L, axis=0)
+        log_L = cp.log(L + 1e-15) 
+        del y_pred_gpu, y_meas, resid_sq, L
+        cp.get_default_memory_pool().free_all_blocks()
+        print(time.time() - to,"was the time taken to compute the Transverse Likelihood calculation. |", end=" ")
+        return log_L - cp.max(log_L)
+    elif likelihood_mode == "Cauchy":
+        gamma_cauchy = sigma_noise * 1.177
+        resid_sq = 1 + ((y_meas[:, None, None, None] - y_pred_gpu)**2/gamma_cauchy**2)
+        log_resid_sq = cp.log(resid_sq)
+        log_L = -cp.sum(log_resid_sq, axis=0)
+        L = cp.exp(log_L - cp.max(log_L))
+        L = L*marginalisation_prob_density[None, :, None]
+        L = cp.sum(L, axis=0)
+        L = cp.sum(L, axis=0)
+        log_L = cp.log(L + 1e-15) 
+        del y_pred_gpu, y_meas, resid_sq, log_resid_sq, L
+        cp.get_default_memory_pool().free_all_blocks()
+        return log_L - cp.max(log_L)
 
 
 def calculate_kl_by(
@@ -760,7 +835,7 @@ def calculate_kl_by(
     t_next_start,
     t_next_end,
     candidate_biases_z,
-    batch_size=20,
+    batch_size=50,
     y_grid_size=DEFAULT_PARAMS.kl_y_grid_size,
     sigma_noise=DEFAULT_PARAMS.sigma_noise_transverse,
     fixed_bz_estimate=DEFAULT_PARAMS.fixed_bz_estimate,
@@ -810,6 +885,7 @@ def check_and_apply_zoom(
     zoom_trigger_ratio: float = 0.2,
     initial_resolution=0.00025,
     B_unk_bound_longitudinal=1,
+    prior_parameters = []
 ) -> tuple:
     # compute B_unk range
     B_unk_init_range = (-B_unk_bound_longitudinal, B_unk_bound_longitudinal)
@@ -974,11 +1050,14 @@ def check_and_apply_zoom(
                 # indices = cp.clip(indices, 0, len(new_b_grid_gpu) - 1)
                 # new_posterior_gpu_1 = new_posterior_gpu[indices]
                 # new_posterior_gpu_1 = cp.interp(new_b_grid_gpu_1, new_b_grid_gpu, new_posterior_gpu)
-                new_posterior_gpu = cp.full(
-                    new_b_grid_gpu.shape,
-                    (1 / 2 / B_unk_bound_longitudinal),
-                    dtype=new_posterior_gpu.dtype,
-                )
+                if prior_parameters:
+                    mean, stddev = prior_parameters
+                    stddev = max(stddev, 200*new_res) # ensure that the stddev is not  too small to cause numerical issues
+                    new_posterior_gpu = cp.exp(-0.5 * ((new_b_grid_gpu - mean) / stddev) ** 2)
+                else:   
+                    new_posterior_gpu = cp.ones_like(
+                        new_b_grid_gpu
+                    )
 
                 normalization = cp.trapz(new_posterior_gpu, new_b_grid_gpu)
                 new_posterior_gpu = new_posterior_gpu / normalization
@@ -1049,22 +1128,36 @@ def run_experiment_longitudinal_estimation(
     config: DataContext,
     params: ParameterContext,
     fixed_by_estimate: float = 0.0,
+    prior_parameters = []
 ):
     print("Starting Adaptive Experiment...")
     time_cursor = params.curr_time
+    noisy_start = cp.random.uniform(-10, 10)
+    time_cursor += noisy_start
 
     t_sim, f_sim, by_sim, sim_spline = get_final_interpolator(config, params)
-    t_exp, f_bias_axis, exp_matrix = load_experiment(config, config.Aligned)
+    t_exp, f_bias_axis, exp_matrix = load_experiment(config, config.Exp_Aligned)
     t_exp, f_bias_axis, exp_matrix = cp.asarray(t_exp), cp.asarray(f_bias_axis), cp.asarray(exp_matrix)
     f_bias_axis = f_bias_axis + params.f_bias_offset_nuisance
 
     b_grid_gpu = cp.arange(-params.B_unk_bound_longitudinal, params.B_unk_bound_longitudinal, params.init_resolution_longitudinal)  # type: ignore
     curr_res = params.init_resolution_longitudinal
-    pdf_val = 1.0 / (2 * params.B_unk_bound_longitudinal)
-    posterior_gpu = cp.full_like(b_grid_gpu, pdf_val)
+
+    #initialising prior - if prior parameters are given, use them to create a Gaussian prior, otherwise use uniform
+    if prior_parameters:
+        # Create a Gaussian prior
+        mean, stddev = prior_parameters
+        stddev = max(stddev, 200*curr_res) # ensure that the stddev is not  too small to cause numerical issues
+        posterior_gpu = cp.exp(-0.5 * ((b_grid_gpu - mean) / stddev) ** 2)
+    else:
+        posterior_gpu = cp.ones_like(b_grid_gpu)
+
+    #the posterior anyways gets normalised later, so i dont need to normalise here, but just to ensure that the values dont blow up and cause numerical issues, normalising here as well
+    posterior_gpu /= cp.sum(posterior_gpu) * curr_res
 
     curr_bias = 0.0
     start_time = params.curr_time
+    start_time += noisy_start.get()
 
     history = {
         "time": [],
@@ -1113,6 +1206,7 @@ def run_experiment_longitudinal_estimation(
             b_grid_gpu,
             sim_spline,
             sigma_noise=params.sigma_noise_longitudinal,
+            likelihood_mode = params.likelihood_mode_longitudinal,
         )
 
         posterior_gpu_1 = cp.log(posterior_gpu) + likelihood
@@ -1136,6 +1230,7 @@ def run_experiment_longitudinal_estimation(
             zoom_trigger_ratio=params.zoom_trigger_ratio,
             initial_resolution=params.init_resolution_longitudinal,
             B_unk_bound_longitudinal=params.B_unk_bound_longitudinal,
+            prior_parameters = prior_parameters,
         )
 
         mode, stddev = calculate_summary_stats(posterior_gpu, b_grid_gpu)
@@ -1164,14 +1259,14 @@ def run_experiment_longitudinal_estimation(
         next_bias, expectedkl = calculate_kl_divergence_gpu(
             posterior_gpu,
             b_grid_gpu,
-            fixed_by_estimate,
+            fixed_by_estimate[1],
             sim_spline,
             t_fut_1,
             t_fut_2,
             f_bias_axis[f_index_1:f_index_2],
             y_grid_size=params.kl_y_grid_size,
             sigma_noise=params.sigma_noise_longitudinal,
-            batch_size=131,
+            batch_size=50,
         )
 
         # random_bias = cp.random.choice(f_bias_axis[f_index_1:f_index_2], size=1, replace=False)
@@ -1203,23 +1298,23 @@ def run_experiment_longitudinal_estimation(
 
     #Plotting
 
-    save_path_mode = os.path.join(config.save_path, f'Longitudinal_Mode_Convergence_MAP_Test_{params.Test}_{ts}.png')
-    plt.plot(np.array(history["time"]), np.array(history["est"])/0.7, label=f"Mode Convergence", marker = '.')
-    plt.axhline(y=history["est"][-1]/0.7, color='r', linestyle='--', label=f"Final Estimate {history['est'][-1]/0.7:.3f}")
-    plt.xlabel("Time (microseconds)")
-    plt.ylabel("Mode - Longitudinal Field Estimate (Gauss)")
-    plt.title("Mode Convergence over experiments - Bayesian")
-    plt.savefig(save_path_mode)
-    plt.close()
+    # save_path_mode = os.path.join(config.save_path, f'Longitudinal_Mode_Convergence_MAP_Test_{params.Test}_{ts}.png')
+    # plt.plot(np.array(history["time"]), np.array(history["est"])/0.7, label=f"Mode Convergence", marker = '.')
+    # plt.axhline(y=history["est"][-1]/0.7, color='r', linestyle='--', label=f"Final Estimate {history['est'][-1]/0.7:.3f}")
+    # plt.xlabel("Time (microseconds)")
+    # plt.ylabel("Mode - Longitudinal Field Estimate ($\mu T$)")
+    # plt.title("Mode Convergence over experiments - Bayesian")
+    # plt.savefig(save_path_mode)
+    # plt.close()
 
-    save_path_std = os.path.join(config.save_path, f'Longitudinal_Std_Convergence_MAP_Test_{params.Test}_{ts}.png')
-    plt.plot(np.array(history["time"]), np.array(history["stddev"])/0.7, label=f"Standard Deviation Convergence", marker = '.')
-    plt.scatter(x=history["time"][-1], y=history["stddev"][-1]/0.7, color='r', linestyle='--', label=f"Final Std Dev {history['stddev'][-1]/0.7:.3f}") 
-    plt.xlabel("Time (microseconds)")
-    plt.ylabel("Standard Deviation (Gauss)")
-    plt.title("Standard Deviation Convergence over experiments - Bayesian")
-    plt.savefig(save_path_std)
-    plt.close()
+    # save_path_std = os.path.join(config.save_path, f'Longitudinal_Std_Convergence_MAP_Test_{params.Test}_{ts}.png')
+    # plt.plot(np.array(history["time"]), np.array(history["stddev"])/0.7, label=f"Standard Deviation Convergence", marker = '.')
+    # plt.scatter(x=history["time"][-1], y=history["stddev"][-1]/0.7, color='r', linestyle='--', label=f"Final Std Dev {history['stddev'][-1]/0.7:.3f}") 
+    # plt.xlabel("Time (microseconds)")
+    # plt.ylabel("Standard Deviation ($\mu T$)")
+    # plt.title("Standard Deviation Convergence over experiments - Bayesian")
+    # plt.savefig(save_path_std)
+    # plt.close()
 
     plot_heat_and_surface(t_exp.get(), f_bias_axis.get(), exp_matrix.get(), trajectory_mode=True, traj_bias = np.array(history["bias"]), curr_time = start_time, title_prefix="Bias Trajectory", save_path = os.path.join(config.save_path ,f"Bias_Trajectory_Longitudinal_Test_{params.Test}_{ts}.png"))
     plt.close()
@@ -1239,6 +1334,7 @@ def check_and_apply_zoom_by(
     zoom_trigger_ratio=0.2,
     b_y_bounds=(DEFAULT_PARAMS.B_unk_bound_transverse_lower, DEFAULT_PARAMS.B_unk_bound_transverse_upper),
     initial_resolution=0.00025,
+    prior_parameters = []
 ):
     to = time.time()
     # PDF -> CDF
@@ -1374,11 +1470,14 @@ def check_and_apply_zoom_by(
                 # indices = cp.clip(indices, 0, len(new_b_grid_gpu) - 1)
                 # new_posterior_gpu_1 = new_posterior_gpu[indices]
                 # new_posterior_gpu_1 = cp.interp(new_b_grid_gpu_1, new_b_grid_gpu, new_posterior_gpu)
-                new_posterior_gpu = cp.full(
-                    new_b_grid_gpu.shape,
-                    (1 / (b_y_bounds[1] - b_y_bounds[0])),
-                    dtype=new_posterior_gpu.dtype,
-                )
+                if prior_parameters:
+                    mean, stddev = prior_parameters
+                    stddev = max(stddev, 200*new_res) # ensure that the stddev is not  too small to cause numerical issues
+                    new_posterior_gpu = cp.exp(-0.5 * ((new_b_grid_gpu - mean) / stddev) ** 2)  
+                else:
+                    new_posterior_gpu = cp.ones_like(
+                        new_b_grid_gpu
+                    )
 
                 normalization = cp.trapz(new_posterior_gpu, new_b_grid_gpu)
                 new_posterior_gpu = new_posterior_gpu / normalization
@@ -1426,23 +1525,34 @@ def run_experiment_y_estimation(
     config: DataContext,
     params: ParameterContext,
     fixed_bz_estimate: float = 0.0,
+    prior_parameters = []
 ):
 
     print("...Starting Adaptive Experiment for Y Estimation...")
     time_cursor = params.curr_time
+    noisy_start = cp.random.uniform(-10, 10)
+    time_cursor += noisy_start
+    
 
-    t_exp, f_bias_axis, exp_matrix = load_experiment(config, config.Aligned)
+    t_exp, f_bias_axis, exp_matrix = load_experiment(config, config.Exp_Aligned)
     t_exp, f_bias_axis, exp_matrix = cp.asarray(t_exp), cp.asarray(f_bias_axis), cp.asarray(exp_matrix)
     t_sim, f_sim, by_sim, sim_interp = get_final_interpolator(config, params)
 
     b_grid_gpu = cp.arange(params.B_unk_bound_transverse_lower, params.B_unk_bound_transverse_upper, params.init_resolution_transverse)  # type: ignore
     curr_res = params.init_resolution_transverse
 
-    posterior_gpu = cp.ones_like(b_grid_gpu)
+    if prior_parameters:
+        # Create a Gaussian prior
+        mean, stddev = prior_parameters
+        stddev = max(stddev, 200*curr_res) # ensure that the stddev is not  too small to cause numerical issues
+        posterior_gpu = cp.exp(-0.5 * ((b_grid_gpu - mean) / stddev) ** 2)
+    else:
+        posterior_gpu = cp.ones_like(b_grid_gpu)
     posterior_gpu /= cp.sum(posterior_gpu) * curr_res
 
     curr_bias_z = 0.0
     start_time = params.curr_time
+    start_time += noisy_start.get()
 
     history = {
         "time": [],
@@ -1488,6 +1598,7 @@ def run_experiment_y_estimation(
             sim_interp,
             sigma_noise=params.sigma_noise_transverse,
             fixed_bz_estimate=fixed_bz_estimate,
+            likelihood_mode = params.likelihood_mode_transverse
         )
 
         if params.print_plot:
@@ -1510,6 +1621,7 @@ def run_experiment_y_estimation(
             zoom_trigger_ratio=params.zoom_trigger_ratio,
             b_y_bounds=(params.B_unk_bound_transverse_lower, params.B_unk_bound_transverse_upper),
             initial_resolution=params.init_resolution_transverse,
+            prior_parameters = prior_parameters,
         )
 
         mode, stddev = calculate_summary_stats(posterior_gpu, b_grid_gpu)
@@ -1534,7 +1646,7 @@ def run_experiment_y_estimation(
 
         #FIXME for random selection protocol tempolrarily disabling this
         next_bias, expectedkl = calculate_kl_by(
-            posterior_gpu, b_grid_gpu, sim_interp, t_fut_1, t_fut_2, f_bias_axis[f_index_1:f_index_2], fixed_bz_estimate=fixed_bz_estimate, sigma_noise=params.sigma_noise_transverse, batch_size=131, y_grid_size=params.kl_y_grid_size
+            posterior_gpu, b_grid_gpu, sim_interp, t_fut_1, t_fut_2, f_bias_axis[f_index_1:f_index_2], fixed_bz_estimate=fixed_bz_estimate[1], sigma_noise=params.sigma_noise_transverse, batch_size=50, y_grid_size=params.kl_y_grid_size
         )
 
         # random_bias = cp.random.choice(f_bias_axis[f_index_1:f_index_2], size=1, replace=False)
@@ -1564,23 +1676,23 @@ def run_experiment_y_estimation(
 
     #Plotting
     
-    save_path_mode = os.path.join(config.save_path, f'Transverse_Mode_Convergence_MAP_Test_{params.Test}_{ts}.png')
-    plt.plot(np.array(history["time"]), np.array(history["est"])/0.7, label=f"Mode Convergence", marker = '.')
-    plt.axhline(y=history["est"][-1]/0.7, color='r', linestyle='--', label=f"Final Estimate {history['est'][-1]/0.7:.3f}")
-    plt.xlabel("Time (microseconds)")
-    plt.ylabel("Mode - Transverse Field Estimate (Gauss)")
-    plt.title("Mode Convergence over experiments - Bayesian")
-    plt.savefig(save_path_mode)
-    plt.close()
+    # save_path_mode = os.path.join(config.save_path, f'Transverse_Mode_Convergence_MAP_Test_{params.Test}_{ts}.png')
+    # plt.plot(np.array(history["time"]), np.array(history["est"])/0.7, label=f"Mode Convergence", marker = '.')
+    # plt.axhline(y=history["est"][-1]/0.7, color='r', linestyle='--', label=f"Final Estimate {history['est'][-1]/0.7:.3f}")
+    # plt.xlabel("Time (microseconds)")
+    # plt.ylabel("Mode - Transverse Field Estimate ($\mu T$)")
+    # plt.title("Mode Convergence over experiments - Bayesian")
+    # plt.savefig(save_path_mode)
+    # plt.close()
 
-    save_path_std = os.path.join(config.save_path, f'Transverse_Std_Convergence_MAP_Test_{params.Test}_{ts}.png')
-    plt.plot(np.array(history["time"]), np.array(history["stddev"])/0.7, label=f"Standard Deviation Convergence", marker = '.')
-    plt.scatter(x=history["time"][-1], y=history["stddev"][-1]/0.7, color='r', linestyle='--', label=f"Final Std Dev {history['stddev'][-1]/0.7:.3f}") 
-    plt.xlabel("Time (microseconds)")
-    plt.ylabel("Standard Deviation (Gauss)")
-    plt.title("Standard Deviation Convergence over experiments - Bayesian")
-    plt.savefig(save_path_std)
-    plt.close()
+    # save_path_std = os.path.join(config.save_path, f'Transverse_Std_Convergence_MAP_Test_{params.Test}_{ts}.png')
+    # plt.plot(np.array(history["time"]), np.array(history["stddev"])/0.7, label=f"Standard Deviation Convergence", marker = '.')
+    # plt.scatter(x=history["time"][-1], y=history["stddev"][-1]/0.7, color='r', linestyle='--', label=f"Final Std Dev {history['stddev'][-1]/0.7:.3f}") 
+    # plt.xlabel("Time (microseconds)")
+    # plt.ylabel("Standard Deviation ($\mu T$)")
+    # plt.title("Standard Deviation Convergence over experiments - Bayesian")
+    # plt.savefig(save_path_std)
+    # plt.close()
 
     plot_heat_and_surface(t_exp.get(), f_bias_axis.get(), exp_matrix.get(), trajectory_mode=True, traj_bias = np.array(history["bias"]), curr_time = params.curr_time, title_prefix="Bias Trajectory", save_path = os.path.join(config.save_path, f"Bias_Trajectory_Transverse_Test_{params.Test}_{ts}.png"))
     plt.close()
@@ -1612,16 +1724,20 @@ def altopt(
         by_history = [fixed_by_estimate]
         stable_bz_runs = 0
         stable_by_runs = 0
+        prior_parameters_z, prior_parameters_y = [], []
 
         # Initial Bz estimation using current By seed
         current_by = fixed_by_estimate
-        by_history.append(current_by)
+        fixed_by_estimate = cp.array([params.B_unk_bound_transverse_lower, current_by, params.B_unk_bound_transverse_upper])
         results = run_experiment_longitudinal_estimation(
             config,
             params,
-            fixed_by_estimate=current_by,
+            fixed_by_estimate=fixed_by_estimate,
         )
         current_bz = results["est"][-1]
+        current_bz_std = results["stddev"][-1]
+        # prior_parameters_z = [current_bz, current_bz_std]
+        fixed_bz_estimate = cp.array([max(-1*params.B_unk_bound_longitudinal,current_bz - 1*current_bz_std), current_bz, min(1*params.B_unk_bound_longitudinal,current_bz + 1*current_bz_std)]) 
         bz_history.append(current_bz)
         print(f"Estimated Bz: {current_bz}")
 
@@ -1630,12 +1746,15 @@ def altopt(
             results_by = run_experiment_y_estimation(
                 config,
                 params,
-                fixed_bz_estimate=current_bz,
+                fixed_bz_estimate=fixed_bz_estimate
             )
             new_by = results_by["est"][-1]
 
             # UPDATE THE GLOBAL BY ESTIMATE
             current_by = new_by
+            current_by_std = results_by["stddev"][-1]
+            # prior_parameters_y = [current_by, current_by_std]
+            fixed_by_estimate = cp.array([max(params.B_unk_bound_transverse_lower,current_by - 1*current_by_std), current_by, min(params.B_unk_bound_transverse_upper,current_by + 1*current_by_std)]) 
 
             # Early-stop tracking for By
             if by_history and abs(new_by - by_history[-1]) <= tol_by:
@@ -1649,12 +1768,15 @@ def altopt(
             results = run_experiment_longitudinal_estimation(
                 config,
                 params,
-                fixed_by_estimate=current_by,
+                fixed_by_estimate=fixed_by_estimate,
             )
             new_bz = results["est"][-1]
 
             # UPDATE THE GLOBAL BZ ESTIMATE
             current_bz = new_bz
+            current_bz_std = results["stddev"][-1]
+            # prior_parameters_z = [current_bz, current_bz_std]
+            fixed_bz_estimate = cp.array([max(-1*params.B_unk_bound_longitudinal,current_bz - 1*current_bz_std), current_bz, min(1*params.B_unk_bound_longitudinal,current_bz + 1*current_bz_std)]) 
 
             # Early-stop tracking for Bz
             if abs(new_bz - bz_history[-1]) <= tol_bz:
@@ -1679,15 +1801,21 @@ def altopt(
         by_history = []
         stable_bz_runs = 0
         stable_by_runs = 0
+        prior_parameters_z, prior_parameters_y = [], []
 
         # Initial By estimation using current Bz seed
         current_bz = fixed_bz_estimate
+        fixed_bz_estimate = cp.array([-1*params.B_unk_bound_longitudinal, current_bz, 1*params.B_unk_bound_longitudinal])
         results = run_experiment_y_estimation(
             config,
             params,
-            fixed_bz_estimate=current_bz,
+            fixed_bz_estimate=fixed_bz_estimate,
         )
         current_by = results["est"][-1]
+        current_by_std = results["stddev"][-1]
+        # prior_parameters_y = [current_by, current_by_std]
+
+        fixed_by_estimate = cp.array([max(params.B_unk_bound_transverse_lower,current_by - 1*current_by_std), current_by, min(params.B_unk_bound_transverse_upper,current_by + 1*current_by_std)]) 
         by_history.append(current_by)
         print(f"Estimated By: {current_by}")
 
@@ -1696,12 +1824,16 @@ def altopt(
             results_bz = run_experiment_longitudinal_estimation(
                 config,
                 params,
-                fixed_by_estimate=current_by,
+                fixed_by_estimate=fixed_by_estimate,
+                prior_parameters = prior_parameters_z
             )
             new_bz = results_bz["est"][-1]
 
             # UPDATE THE GLOBAL BY ESTIMATE
             current_bz = new_bz
+            current_bz_std = results_bz["stddev"][-1]
+            # prior_parameters_z = [current_bz, current_bz_std]
+            fixed_bz_estimate = cp.array([max(-1*params.B_unk_bound_longitudinal,current_bz - 1*current_bz_std), current_bz, min(1*params.B_unk_bound_longitudinal,current_bz + 1*current_bz_std)])
 
             # Early-stop tracking for By
             if bz_history and abs(new_bz - bz_history[-1]) <= tol_bz:
@@ -1715,12 +1847,16 @@ def altopt(
             results = run_experiment_y_estimation(
                 config,
                 params,
-                fixed_bz_estimate=current_bz,
+                fixed_bz_estimate=fixed_bz_estimate,
+                prior_parameters=prior_parameters_y
             )
             new_by = results["est"][-1]
 
             # UPDATE THE GLOBAL BZ ESTIMATE
             current_by = new_by
+            current_by_std = results["stddev"][-1]
+            fixed_by_estimate = cp.array([max(params.B_unk_bound_transverse_lower,current_by - 1*current_by_std), current_by, min(params.B_unk_bound_transverse_upper,current_by + 1*current_by_std)]) 
+            # prior_parameters_y = [current_by, current_by_std]
 
             # Early-stop tracking for Bz
             if abs(new_by - by_history[-1]) <= tol_by:

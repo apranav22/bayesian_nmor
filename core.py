@@ -478,7 +478,7 @@ def plot_heat_and_surface(
             label="Trajectory",
         )
     plt.colorbar(label="Probe Transmitted Intensity")
-    plt.title(f"{title_prefix} heatmap (rows=time, cols=freq)")
+    plt.title(f"{title_prefix}", fontsize = 12)
     plt.tight_layout()
     if save_path != "": 
         plt.savefig(save_path); plt.close()
@@ -490,7 +490,7 @@ def plot_heat_and_surface(
     ax.set_xlabel("Applied Bias Field ($\mu T$)")
     ax.set_ylabel("Time (microseconds)")
     ax.set_zlabel("Probe Transmitted Intensity")
-    plt.title(f"{title_prefix} 3D surface")
+    plt.title(f"{title_prefix}", fontsize = 12)
     plt.tight_layout()
     if save_path == "": plt.show()
     if save_path != "": plt.close()
@@ -603,7 +603,7 @@ def get_predictions_batch(interpolator, t_pts, z_vals, y_grid, mode = ""):
         print(time.time() - to,"was the time taken to compute the Interpolated Values.|", end=" ")
         return predictions.reshape(T_mesh.shape)
     
-    #for longiduinal case, i need to make the edit here for the marginalisation of Bz FIXME: Havent done marginalisation part for KL divergence, implement that as well
+    #for longitudinal case, i need to make the edit here for the marginalisation of Bz FIXME: Havent done marginalisation part for KL divergence, implement that as well
     elif mode == "Longitudinal Likelihood":
         to = time.time()
         # T_mesh, Z_mesh = np.meshgrid(t_pts, z_vals, indexing='ij')
@@ -631,8 +631,29 @@ def get_predictions_batch(interpolator, t_pts, z_vals, y_grid, mode = ""):
         Z_mesh = cp.broadcast_to(Z_mesh, final_shape) 
         Y_mesh = cp.broadcast_to(Y_mesh, final_shape)
         predictions = interpolator.interpolate(T_mesh.ravel(), Z_mesh.ravel(), Y_mesh.ravel())
-        print(time.time() - to,"was the time taken to compute the Interpolated Values.|", end=" ")
+        # print(time.time() - to,"was the time taken to compute the Interpolated Values.|", end=" ")
         return predictions.reshape(final_shape)    
+    
+    elif mode == "Time Series Frequentist":
+        to = time.time()
+        # T_mesh, Z_mesh = np.meshgrid(t_pts, z_vals, indexing='ij')
+        # Y_mesh = np.full_like(T_mesh, y_grid)
+        T_array = t_pts[:,None, None]
+        if z_vals.ndim == 0 or cp.isscalar(z_vals):
+            Z_mesh = cp.asarray([z_vals])[None,:, None]
+        else:
+            Z_mesh = z_vals[None,:, None]
+        if y_grid.ndim == 0 or cp.isscalar(y_grid):
+            Y_mesh = cp.asarray([y_grid])[None,None,:]
+        else:
+            Y_mesh = y_grid[None,None,:]
+        final_shape = (T_array.shape[0], Z_mesh.shape[1], Y_mesh.shape[2])
+        T_mesh = cp.broadcast_to(T_array, final_shape)
+        Z_mesh = cp.broadcast_to(Z_mesh, final_shape) 
+        Y_mesh = cp.broadcast_to(Y_mesh, final_shape)
+        predictions = interpolator.interpolate(T_mesh.ravel(), Z_mesh.ravel(), Y_mesh.ravel())
+        # print(time.time() - to,"was the time taken to compute the Interpolated Values.|", end=" ")
+        return predictions.reshape(final_shape)   
     
     elif mode == "Longitudinal KL":
         to = time.time()
